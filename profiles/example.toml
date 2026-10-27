@@ -1,0 +1,13 @@
+id = 1
+default_egress = "stub"
+timezone = "UTC"
+locale = "C"
+synthetic_hostname = "appsbx-example"
+synthetic_mac = "02:00:00:00:00:01"
+synthetic_cpu_count = 2
+synthetic_ram_mb = 2048
+# Fixed capacity reported by the private compatibility df command; it is not
+# derived from the host filesystem and is reported as entirely available.
+synthetic_disk_mb = 102400
+runtime_uid = 1000
+runtime_gid = 1000
