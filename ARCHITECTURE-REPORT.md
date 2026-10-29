@@ -88,6 +88,37 @@ and only the staged x11vnc closure plus the read-only private X socket. No
 host X11 socket, Wayland socket, Xauthority, display environment variable, or
 host network is supplied to Electron or x11vnc.
 
+An explicit `--display host` backend is available for performance experiments.
+It validates a local Wayland socket first, but when a local Xwayland
+`DISPLAY=:N` socket exists it also exposes only that socket and the selected
+Xauthority cookie, and explicitly selects X11 for the packaged X11-era
+Electron build. This avoids an incompatible native-Wayland Ozone choice. If
+no Xwayland socket exists, native Wayland remains the available path. The host
+runtime directory and
+`/tmp/.X11-unix` directory are never mounted wholesale. This is a capability
+trade-off: a host compositor/X server may expose display metadata, input, or
+screen content according to its protocol. Xvfb/VNC remains the stronger
+display-isolation choice; the other filesystem, PID/UTS/user, synthetic
+identity, and network restrictions remain enabled in host mode.
+
+### Hardware GPU backend
+
+On a Linux host with an accessible DRM render node and supported Mesa driver,
+`--display host --gpu-mode hardware` detects the kernel driver, stages only
+the matching DRI module and its ELF dependencies, and adds one exact
+`--dev-bind /dev/dri/renderD* /dev/dri/renderD*` to Bubblewrap. The privileged
+helper accepts that bind only for a DRM character device (major 226, render
+minor >= 128); card nodes, control nodes, optional binds, and arbitrary
+devices remain rejected.
+
+No host `/sys`, udev database, GPU control node, or host library directory is
+mounted. Hardware mode adds no software-rendering flags, allowing Chromium to
+select EGL/GL through the staged Mesa driver, and fails closed when the render
+node, driver mapping, or DRI module is unavailable. Instances still share the
+physical GPU and kernel driver, so GPU memory contention and fingerprinting
+remain possible. A hostile application requires a stronger boundary such as a
+VM or a separately assigned GPU.
+
 When Xvfb is requested, the optional URL broker follows the application-side
 branch, not the host-viewer branch. It stages a fixed installed Chrome package
 into the private runtime, accepts only one HTTP(S) URL through a private

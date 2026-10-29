@@ -35,7 +35,10 @@ def require_egress_consistency(state_dir: Path, requested: str | None, force: bo
     marker = state_dir / "last-egress"
     previous = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
     if previous and previous != requested and not force:
-        raise StateError("egress change requires explicit force")
+        raise StateError(
+            f"egress change from {previous!r} to {requested!r} requires explicit force; "
+            "rerun with --force-egress after verifying the selected interface"
+        )
 
 
 def record_egress(state_dir: Path, requested: str | None) -> None:

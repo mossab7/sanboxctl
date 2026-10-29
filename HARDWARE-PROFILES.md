@@ -17,7 +17,7 @@ Example:
 
 ```text
 ./sandboxctl run --profile example --identity auto --hardware-class laptop \
-  --mode stub --display xvfb --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --mode stub --display xvfb --execute -- /opt/app/zaap
 ./sandboxctl identity inspect example
 ```
 

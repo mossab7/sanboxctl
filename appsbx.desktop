@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=appsbx Zaap Instances
+Comment=Manage isolated Zaap instances
+Exec=appsbx-gui
+TryExec=appsbx-gui
+Terminal=false
+Categories=Game;Utility;

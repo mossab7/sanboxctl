@@ -189,7 +189,24 @@ def _check_bwrap_command(command: list[str]) -> None:
         if item == "--unshare-net":
             raise NetworkError("real-mode Bubblewrap command must join the prepared namespace")
         if item in {"--dev-bind", "--dev-bind-try", "--bind-try"}:
-            raise NetworkError("privileged helper rejects writable or device mounts")
+            if item != "--dev-bind":
+                raise NetworkError("privileged helper rejects optional or writable device mounts")
+            try:
+                source, destination = command[index + 1], command[index + 2]
+                source_path = Path(source)
+                if (
+                    source != destination
+                    or source_path.parent != Path("/dev/dri")
+                    or not source_path.name.startswith("renderD")
+                    or not source_path.name[7:].isdigit()
+                    or source_path.is_symlink()
+                ):
+                    raise NetworkError("only an exact DRM render-node bind is permitted")
+                info = source_path.stat(follow_symlinks=False)
+                if not stat.S_ISCHR(info.st_mode) or os.major(info.st_rdev) != 226 or os.minor(info.st_rdev) < 128:
+                    raise NetworkError("only a DRM render node may be exposed")
+            except (IndexError, OSError) as exc:
+                raise NetworkError("DRM render-node bind is unavailable") from exc
         if item == "--bind":
             try:
                 source, destination = command[index + 1], command[index + 2]

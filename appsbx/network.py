@@ -11,6 +11,8 @@ import ipaddress
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import tempfile
 from typing import Iterable
 
@@ -64,6 +66,98 @@ def validate_interface_name(name: str) -> str:
     if not isinstance(name, str) or not IFACE_RE.fullmatch(name):
         raise NetworkError("invalid egress interface name")
     return name
+
+
+def _interface_dns_servers(interface: str) -> tuple[ipaddress.IPv4Address, ...]:
+    """Read DNS servers assigned to one interface, never host-wide DNS."""
+    nmcli = shutil.which("nmcli")
+    if nmcli is None:
+        return ()
+    try:
+        result = subprocess.run(
+            [nmcli, "-g", "IP4.DNS", "device", "show", interface],
+            check=True, capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    servers: list[ipaddress.IPv4Address] = []
+    for value in result.stdout.splitlines():
+        for item in value.split(","):
+            try:
+                address = ipaddress.ip_address(item.strip())
+            except ValueError:
+                continue
+            if isinstance(address, ipaddress.IPv4Address) and not address.is_loopback and not address.is_unspecified:
+                if address not in servers:
+                    servers.append(address)
+    return tuple(servers)
+
+
+def _live_interface_definition(interface: str) -> EgressDefinition | None:
+    """Build a fail-closed definition from a currently connected interface.
+
+    This is intentionally read-only.  The privileged helper revalidates the
+    interface, route, and gateway immediately before creating the namespace.
+    Dynamic definitions are therefore convenience discovery, not a way to
+    bypass the selected-egress checks.
+    """
+    interface = validate_interface_name(interface)
+    if interface == "lo":
+        return None
+    operstate = Path("/sys/class/net") / interface / "operstate"
+    try:
+        if operstate.read_text(encoding="ascii").strip() not in {"up", "unknown"}:
+            return None
+    except OSError:
+        return None
+    ip = shutil.which("ip")
+    if ip is None:
+        return None
+    try:
+        address = subprocess.run(
+            [ip, "-4", "addr", "show", "dev", interface],
+            check=True, capture_output=True, text=True, timeout=2,
+        ).stdout
+        routes = subprocess.run(
+            [ip, "-4", "route", "show", "dev", interface],
+            check=True, capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not re.search(r"\binet\s+[0-9]+(?:\.[0-9]+){3}/\d+", address):
+        return None
+    gateway = None
+    for line in routes.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == "default" and fields[1] == "via":
+            try:
+                gateway = _parse_ipv4(fields[2], "gateway")
+            except NetworkError:
+                return None
+            break
+    if gateway is None:
+        return None
+    # Prefer DNS assigned to this interface. Do not copy host-wide
+    # /etc/resolv.conf: on multi-homed systems it may point at another link.
+    # The gateway remains a conservative fallback for DHCP networks without
+    # per-link DNS metadata.
+    dns_servers = _interface_dns_servers(interface) or (gateway,)
+    return EgressDefinition(f"auto-{interface}", interface, gateway, dns_servers, False)
+
+
+def discover_dynamic_egresses() -> tuple[EgressDefinition, ...]:
+    """Discover live IPv4 interfaces that have their own default route."""
+    root = Path("/sys/class/net")
+    try:
+        names = sorted(path.name for path in root.iterdir())
+    except OSError:
+        return ()
+    result = []
+    for interface in names:
+        definition = _live_interface_definition(interface)
+        if definition is not None:
+            result.append(definition)
+    return tuple(result)
 
 
 def resource_names(profile_id: int) -> ResourceNames:
@@ -122,6 +216,12 @@ def _parse_ipv4(value: str, key: str) -> ipaddress.IPv4Address:
 def load_egress_definition(name: str, directory: Path = DEFAULT_EGRESS_DIR) -> EgressDefinition:
     """Load a fixed-format egress definition without invoking a shell."""
     validate_egress_name(name)
+    if name.startswith("auto-"):
+        interface = name[5:]
+        definition = _live_interface_definition(interface)
+        if definition is None or definition.name != name:
+            raise NetworkError(f"automatic egress is unavailable: {name}")
+        return definition
     root = directory.resolve()
     path = directory / f"{name}.conf"
     try:
@@ -154,6 +254,18 @@ def load_egress_definition(name: str, directory: Path = DEFAULT_EGRESS_DIR) -> E
     ipv6 = _parse_bool(values.get("ipv6", "false"), "ipv6")
     if ipv6:
         raise NetworkError("IPv6 real egress is disabled until an IPv6 route/NAT policy is configured")
+    # Named definitions are still explicit selections, but DHCP gateways can
+    # change while a profile is persistent. Refresh only the route endpoint
+    # from the selected interface at launch; do not fall back to another
+    # interface and keep the helper's privileged revalidation as the final
+    # fail-closed check.
+    if gateway is not None and not ipv6:
+        live = _live_interface_definition(interface)
+        if live is not None:
+            if live.gateway is not None:
+                gateway = live.gateway
+            if values.get("type") in {"interface", "physical"} and live.dns_servers:
+                dns_servers = live.dns_servers
     return EgressDefinition(name, interface, gateway, dns_servers, ipv6)
 
 

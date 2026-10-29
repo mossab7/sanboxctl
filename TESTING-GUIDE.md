@@ -31,6 +31,12 @@ export PYTHONPATH="$PWD"
 ./sandboxctl capabilities
 ```
 
+The target application is managed at `apps/zaap.AppDir` and is resolved from
+the project root. All launch commands below therefore work without an
+`APPDIR` variable or an `--app-root` option. To intentionally use another
+extracted AppDir, add `--app-root /path/to/other.AppDir`; it must contain an
+executable `zaap` and is validated before the sandbox starts.
+
 Save the output only if it contains no sensitive local additions. The normal
 capability output contains tool availability and versions, not host IDs or
 network addresses.
@@ -110,7 +116,7 @@ capabilities.stdout
 capabilities.stderr
 profile-validate.stdout
 profile-validate.stderr
-run-plan.stdout                 # if APPSBX_APP_ROOT was supplied
+run-plan.stdout                 # uses apps/zaap.AppDir unless overridden
 run-plan.stderr
 run-plan.status
 rootfs-inspect.stdout           # if APPSBX_APPIMAGE was supplied
@@ -166,7 +172,6 @@ the generated plan, so the corresponding command is:
 ./sandboxctl run \
   --profile example \
   --mode stub \
-  --app-root "$APPDIR" \
   -- /opt/app/zaap
 ```
 
@@ -212,7 +217,7 @@ Then inspect the plan without executing it:
 
 ```bash
 ./sandboxctl run --profile example --mode real --egress wifi \
-  --app-root "$APPDIR" -- /opt/app/zaap
+  -- /opt/app/zaap
 ```
 
 Real execution requires IPv4 forwarding to already be enabled and a narrow
@@ -220,6 +225,12 @@ sudoers rule for the root-owned helper. The helper disables IPv6 in the guest,
 uses only the configured DNS servers, drops all non-selected egress traffic,
 and cleans up the namespace/veth/rules after the child exits. Do not test it
 on a production host until the administrator has reviewed the generated plan.
+
+The desktop GUI uses `pkexec` so authorization can be shown by the desktop
+policy agent. A plain `sudo` password prompt cannot work inside the GUI's
+background `QProcess`; if no policy agent is installed, use a reviewed
+narrow `NOPASSWD` sudoers rule or authenticate `sudo` in a terminal before a
+CLI launch.
 
 ## 7. Attempt the stub execution
 
@@ -229,7 +240,6 @@ Only do this after the dry-run is captured:
 ./sandboxctl run \
   --profile example \
   --mode stub \
-  --app-root "$APPDIR" \
   --execute \
   -- /opt/app/zaap \
   > sandbox-execute.stdout \
@@ -268,7 +278,7 @@ For this Electron GUI application, the headless safe execution form is:
 ```bash
 ./sandboxctl run \
   --profile example --mode stub --display xvfb \
-  --app-root "$APPDIR" --execute -- /opt/app/zaap \
+  --execute -- /opt/app/zaap \
   > sandbox-execute.stdout 2> sandbox-execute.stderr
 printf '%s\n' "$?" > sandbox-execute.status
 ```
@@ -298,7 +308,7 @@ available. Then run:
 ```text
 ./sandboxctl run \
   --profile example --mode real --egress wifi --force-egress \
-  --display xvfb-vnc --app-root "$APPDIR" --execute -- /opt/app/zaap --disable-gpu
+  --display xvfb-vnc --execute -- /opt/app/zaap --disable-gpu
 ```
 
 The command prints an endpoint such as `appsbx VNC: 127.0.0.1::54321` and
@@ -312,7 +322,7 @@ To run another copy concurrently, choose an unused instance ID:
 
 ```text
 ./sandboxctl run --profile example --instance-id 2 --mode real --egress wifi \
-  --force-egress --display xvfb-vnc --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --force-egress --display xvfb-vnc --execute -- /opt/app/zaap
 ```
 
 The selected ID becomes the isolated network/resource ID and a suffix in the
@@ -347,7 +357,7 @@ private display is present:
 ```bash
 ./sandboxctl run \
   --profile example --mode real --egress wifi --force-egress \
-  --display xvfb-vnc --url-broker auto --app-root "$APPDIR" --execute -- /opt/app/zaap --disable-gpu
+  --display xvfb-vnc --url-broker auto --execute -- /opt/app/zaap --disable-gpu
 ```
 
 The first matching profile runtime build copies the browser package and may
@@ -396,7 +406,7 @@ exception:
 set +e
 timeout 8s ./sandboxctl run \
   --profile example --mode stub --display xvfb \
-  --app-root "$APPDIR" --execute -- /opt/app/zaap \
+  --execute -- /opt/app/zaap \
   --disable-gpu --disable-software-rasterizer \
   --enable-logging=stderr --v=1 \
   > sandbox-smoke.stdout 2> sandbox-smoke.stderr
@@ -489,3 +499,28 @@ they create temporary state directories and clean them up automatically. The
 CLI `identity ensure` and `run --execute` use the repository's
 `sandbox-state/` directory and intentionally persist the synthetic identity
 for that profile.
+
+## 12. Hardware GPU verification
+
+Inspect the host without changing it:
+
+```sh
+ls -l /dev/dri
+glxinfo -B
+eglinfo --device
+```
+
+Run the hardware path only with the host display backend:
+
+```sh
+./sandboxctl run --profile example --mode stub --display host \
+  --gpu-mode hardware --execute -- /opt/app/zaap
+```
+
+The startup line reports the selected render node and Mesa driver. Verify the
+child GPU command line and the application's Chromium GPU diagnostics. A
+successful sandbox launch is not sufficient: `SwiftShader`, `llvmpipe`,
+`MESA: Failed to query drm device`, or an exited GPU process means that this
+Electron/display combination is still software-rendered. Do not broaden the
+device or `/sys` mounts to suppress those messages; hardware mode intentionally
+fails to provide complete GPU isolation and should remain a measured opt-in.

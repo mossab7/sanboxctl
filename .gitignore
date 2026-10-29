@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+my_pyside_env/
+pyside-setup/
+sandbox-state/
+test-logs/
+*.stdout
+*.stderr
+*.status
+*.ndjson
+*.launcher.log
+sandbox-strace.*
+apps/zaap.AppDir/

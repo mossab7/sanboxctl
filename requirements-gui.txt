@@ -1,0 +1,3 @@
+# Kept separate from the sandbox runtime: the CLI is standard-library only.
+# pip chooses the appropriate wheel for the host's supported Python ABI.
+PySide6>=6.6,<7

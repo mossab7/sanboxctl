@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import socket
 import struct
 import tempfile
@@ -18,10 +20,13 @@ from appsbx.identity import (
     PROFILE_HOME_MARKER_CONTENT,
     ensure_identity,
     create_auto_identity,
+    ensure_generated_identity,
     identity_report,
 )
-from appsbx.hardware import generate_hardware, validate_hardware
-from appsbx.cli import _instance_profile
+from appsbx.hardware import MAX_SYNTHETIC_DISK_MB, generate_hardware, validate_hardware
+from appsbx.host_display import HostDisplay, HostDisplayError, detect_host_display
+from appsbx.gpu import detect_hardware_gpu
+from appsbx.cli import _gpu_flags, _instance_profile, _sandbox_compatibility_flags
 from appsbx.display import (
     DISPLAY_MARKER_CONTENT,
     OWNER_FILE,
@@ -39,6 +44,8 @@ from appsbx.elf import (
     prepare_runtime_bundle,
     prepare_vnc_bundle,
     synthetic_df_script,
+    _validate_url_broker_display,
+    _downloaded_game_entrypoint,
 )
 from appsbx.locking import LockBusy, profile_lock
 from appsbx.network import (
@@ -54,7 +61,7 @@ from appsbx.network import (
 from appsbx.profile import Profile, ProfileError, load_profile
 from appsbx.probe import category_report, current_observations, host_denylist, leak_categories
 from appsbx.rootfs import inspect_appimage, extraction_command
-from appsbx.runtime import build_vnc_bridge_command, execute, prepare_plan
+from appsbx.runtime import LaunchPlan, _authorization_prefix, _execution_command, build_vnc_bridge_command, execute, prepare_plan
 from appsbx.state import StateError, record_egress, require_egress_consistency
 
 
@@ -102,6 +109,36 @@ class IdentityTests(unittest.TestCase):
         self.assertGreaterEqual(first.logical_cpus, first.physical_cores)
         self.assertIn(first.cpu_model, first.cpu_model)
 
+    def test_every_generated_hardware_class_has_a_df_compatible_disk_capacity(self):
+        for hardware_class in ("laptop", "desktop", "workstation", "random"):
+            for _ in range(16):
+                hardware = generate_hardware(hardware_class)
+                self.assertGreaterEqual(hardware.disk_size_mb, 128_000)
+                self.assertLessEqual(hardware.disk_size_mb, MAX_SYNTHETIC_DISK_MB)
+                synthetic_df_script(hardware.disk_size_mb)
+
+    def test_existing_oversized_auto_disk_is_migrated_before_materialization(self):
+        profile = load_profile(EXAMPLE)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "instance"
+            identity = ensure_generated_identity(profile, state, "workstation")
+            identity_path = state / "identity.json"
+            raw = json.loads(identity_path.read_text(encoding="utf-8"))
+            raw["hardware"]["disk_size_mb"] = 1_920_000
+            identity_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            migrated = ensure_generated_identity(profile, state, "workstation")
+
+            self.assertEqual(migrated.hardware.disk_size_mb, 960_000)
+            self.assertEqual(
+                migrated.file_paths()["/sys/block/vda/size"].read_text().strip(),
+                str(960_000 * 2048),
+            )
+            self.assertEqual(
+                json.loads(identity_path.read_text(encoding="utf-8"))["hardware"]["disk_size_mb"],
+                960_000,
+            )
+
     def test_automatic_identity_uses_private_unique_state(self):
         profile = load_profile(EXAMPLE)
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +182,27 @@ class IdentityTests(unittest.TestCase):
             )
             self.assertIn("/sys/class/dmi/id/product_name", first.file_paths())
             self.assertIn(first.hardware.platform, first.file_paths()["/sys/class/dmi/id/product_name"].read_text())
+
+    def test_dmi_serials_and_uuid_are_per_identity_and_not_host_values(self):
+        profile = load_profile(EXAMPLE)
+        fields = ("product_serial", "product_uuid", "board_serial", "chassis_serial")
+        with tempfile.TemporaryDirectory() as directory:
+            first = create_auto_identity(profile, Path(directory), "laptop")
+            second = create_auto_identity(profile, Path(directory), "laptop")
+            for field in fields:
+                first_value = first.file_paths()[f"/sys/class/dmi/id/{field}"].read_text().strip()
+                second_value = second.file_paths()[f"/sys/class/dmi/id/{field}"].read_text().strip()
+                self.assertTrue(first_value)
+                self.assertNotEqual(first_value, second_value)
+                host_path = Path("/sys/class/dmi/id") / field
+                if host_path.exists():
+                    try:
+                        host_value = host_path.read_text().strip()
+                    except PermissionError:
+                        host_value = None
+                    if host_value:
+                        self.assertNotEqual(first_value, host_value)
+                        self.assertNotEqual(second_value, host_value)
 
     def test_profile_home_is_persistent_private_and_initially_empty(self):
         profile = load_profile(EXAMPLE)
@@ -245,6 +303,34 @@ class NetworkTests(unittest.TestCase):
         with self.assertRaises(NetworkError):
             build_plan(1, "real")
 
+    def test_automatic_egress_definitions_are_loaded_from_live_interfaces(self):
+        from appsbx.network import EgressDefinition, load_egress_definition
+        definition = EgressDefinition(
+            "auto-wlp61s0", "wlp61s0", ipaddress.ip_address("192.0.2.1"),
+            (ipaddress.ip_address("192.0.2.53"),), False,
+        )
+        with mock.patch("appsbx.network._live_interface_definition", return_value=definition):
+            self.assertEqual(load_egress_definition("auto-wlp61s0").interface, "wlp61s0")
+
+    def test_named_interface_egress_refreshes_stale_dhcp_gateway(self):
+        from appsbx.network import EgressDefinition, load_egress_definition
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wifi.conf"
+            path.write_text(
+                "name=wifi\ntype=interface\ninterface=wlp61s0\n"
+                "gateway=192.168.11.1\ndns=41.214.140.4\nipv6=false\n",
+                encoding="utf-8",
+            )
+            live = EgressDefinition(
+                "auto-wlp61s0", "wlp61s0", ipaddress.ip_address("10.30.254.254"),
+                (ipaddress.ip_address("10.30.254.254"),), False,
+            )
+            with mock.patch("appsbx.network._live_interface_definition", return_value=live):
+                definition = load_egress_definition("wifi", Path(directory))
+            self.assertEqual(definition.interface, "wlp61s0")
+            self.assertEqual(definition.gateway, ipaddress.ip_address("10.30.254.254"))
+            self.assertEqual(definition.dns_servers, (ipaddress.ip_address("10.30.254.254"),))
+
     def test_cleanup_is_scoped_to_instance_resources(self):
         from appsbx import network_helper
         calls = []
@@ -270,6 +356,18 @@ class NetworkTests(unittest.TestCase):
             network_helper._check_bwrap_command(base + ["--bind", "/", "/host"])
         with self.assertRaises(NetworkError):
             network_helper._bwrap_ids(base[:1] + ["--die-with-parent", "--unshare-user", "--cap-drop", "ALL", "--clearenv", "--uid", "0", "--gid", "0"])
+
+    def test_privileged_helper_rejects_drm_control_node(self):
+        from appsbx import network_helper
+        node = Path("/dev/dri/card0")
+        if not node.exists():
+            self.skipTest("host has no DRM control node")
+        base = [
+            "bwrap", "--die-with-parent", "--unshare-user", "--cap-drop", "ALL",
+            "--clearenv", "--uid", "1000", "--gid", "1000",
+        ]
+        with self.assertRaises(NetworkError):
+            network_helper._check_bwrap_command(base + ["--dev-bind", str(node), str(node)])
 
     def test_privileged_helper_allows_only_marked_private_x11_bind(self):
         from appsbx import network_helper
@@ -391,6 +489,210 @@ class NetworkTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_execution_always_uses_a_private_process_group(self):
+        import appsbx.runtime as runtime_module
+        plan = LaunchPlan(["/bin/true"], (), {}, "stub")
+        with mock.patch.object(runtime_module.subprocess, "Popen", wraps=runtime_module.subprocess.Popen) as popen:
+            self.assertEqual(execute(plan), 0)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_sudo_execution_preserves_tty_for_password_prompt(self):
+        import appsbx.runtime as runtime_module
+        plan = LaunchPlan(["sudo", "true"], (), {}, "stub")
+        with mock.patch.object(runtime_module.os, "isatty", return_value=True), \
+             mock.patch.object(runtime_module.subprocess, "Popen") as popen:
+            child = mock.Mock()
+            child.poll.return_value = 0
+            child.wait.return_value = 0
+            popen.return_value = child
+            self.assertEqual(execute(plan), 0)
+            self.assertFalse(popen.call_args.kwargs["start_new_session"])
+
+    def test_gpu_mode_is_opt_in(self):
+        self.assertEqual(_gpu_flags("auto"), [])
+        self.assertIn("--disable-gpu", _gpu_flags("software"))
+        self.assertIn("--use-gl=desktop", _gpu_flags("hardware"))
+        self.assertIn("--disable-software-rasterizer", _gpu_flags("hardware"))
+        self.assertNotIn("--disable-gpu", _gpu_flags("hardware"))
+
+    def test_sandbox_disables_unavailable_audio_output(self):
+        self.assertEqual(_sandbox_compatibility_flags(), ["--disable-audio-output"])
+
+    def test_hardware_gpu_detection_never_selects_card_nodes(self):
+        render_nodes = list(Path("/dev/dri").glob("renderD*"))
+        if not render_nodes:
+            self.skipTest("host has no DRM render node")
+        info = detect_hardware_gpu()
+        self.assertTrue(info.render_node.name.startswith("renderD"))
+        self.assertEqual(info.render_node.parent, Path("/dev/dri"))
+        self.assertNotIn("card", info.render_node.name)
+
+    def test_hardware_bundle_contains_only_static_gpu_metadata(self):
+        render_nodes = list(Path("/dev/dri").glob("renderD*"))
+        if not render_nodes:
+            self.skipTest("host has no DRM render node")
+        info = detect_hardware_gpu()
+        with tempfile.TemporaryDirectory() as directory:
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            bundle = prepare_runtime_bundle(
+                app_root, ["/opt/app/zaap"], Path(directory) / "state",
+                display_backend="host", gpu_info=info,
+            )
+            vendor = bundle.root / "sys" / info.sysfs_device.relative_to("/sys") / "vendor"
+            udev = bundle.root / "run" / "udev" / "data" / (
+                f"c{os.major(info.render_node.stat().st_rdev)}:{os.minor(info.render_node.stat().st_rdev)}"
+            )
+            expected_vendor = (info.sysfs_device / "vendor").read_text(encoding="ascii").strip()
+            self.assertEqual(vendor.read_text(encoding="ascii").strip(), expected_vendor)
+            config = bundle.root / "sys" / info.sysfs_device.relative_to("/sys") / "config"
+            self.assertTrue(config.is_file())
+            staged = config.read_bytes()
+            host_config = (info.sysfs_device / "config").read_bytes()[:64]
+            self.assertEqual(len(staged), 64)
+            self.assertEqual(staged[:4], host_config[:4])
+            self.assertEqual(staged[8:12], host_config[8:12])
+            revision = bundle.root / "sys" / info.sysfs_device.relative_to("/sys") / "revision"
+            pci_class = bundle.root / "sys" / info.sysfs_device.relative_to("/sys") / "class"
+            self.assertEqual(staged[8], int(revision.read_text(encoding="ascii").strip(), 16))
+            self.assertEqual(staged[9:12], int(pci_class.read_text(encoding="ascii").strip(), 16).to_bytes(3, "little"))
+            self.assertEqual(staged[0x10:0x28], b"\0" * 24)
+            self.assertEqual(staged[0x34], 0)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o444)
+            self.assertNotEqual(staged, host_config)
+            for candidate in (bundle.root / "sys").rglob("*"):
+                if candidate.is_file() and not candidate.is_symlink():
+                    self.assertNotEqual(candidate.read_bytes(), host_config, str(candidate))
+            vendor_value = int(vendor.read_text(encoding="ascii").strip(), 16)
+            device_id = bundle.root / "sys" / info.sysfs_device.relative_to("/sys") / "device"
+            device_value = int(device_id.read_text(encoding="ascii").strip(), 16)
+            self.assertEqual(staged[:2], vendor_value.to_bytes(2, "little"))
+            self.assertEqual(staged[2:4], device_value.to_bytes(2, "little"))
+            render_device = bundle.root / "sys" / info.sysfs_render_node.relative_to("/sys") / "device"
+            self.assertEqual(os.readlink(render_device), "../../../" + info.sysfs_device.name)
+            class_device = bundle.root / "sys" / "class" / "drm" / info.render_node.name / "device"
+            self.assertEqual(os.readlink(class_device), "/sys/devices/" + str(info.sysfs_device.relative_to("/sys/devices")))
+            self.assertFalse((bundle.root / "sys" / "dev" / "char" / f"{os.major(info.render_node.stat().st_rdev)}:{os.minor(info.render_node.stat().st_rdev)}" / "device").exists())
+            self.assertTrue(udev.is_file())
+            self.assertFalse((bundle.root / "sys" / "class" / "dmi").exists())
+
+    def test_host_display_prefers_wayland_and_binds_only_its_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            runtime.mkdir()
+            socket_path = runtime / "wayland-test"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            try:
+                display = detect_host_display({
+                    "XDG_RUNTIME_DIR": str(runtime),
+                    "WAYLAND_DISPLAY": "wayland-test",
+                    "DISPLAY": "tcp-host:0",
+                })
+            finally:
+                listener.close()
+            self.assertEqual(display.backend, "wayland")
+            self.assertEqual(display.environment[:2], (
+                ("WAYLAND_DISPLAY", "wayland-0"),
+                ("XDG_RUNTIME_DIR", "/run/appsbx"),
+            ))
+            self.assertEqual(display.mounts, ((socket_path.resolve(), "/run/appsbx/wayland-0"),))
+
+    def test_host_display_keeps_native_wayland_when_xwayland_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            runtime.mkdir()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(runtime / "wayland-0"))
+            try:
+                display = detect_host_display({
+                    "XDG_RUNTIME_DIR": str(runtime),
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "DISPLAY": ":999",
+                })
+            finally:
+                listener.close()
+            self.assertEqual(display.backend, "wayland")
+            self.assertEqual(len(display.mounts), 1)
+
+    def test_host_display_selects_xwayland_for_legacy_electron_when_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            runtime.mkdir()
+            wayland_path = runtime / "wayland-0"
+            wayland_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wayland_listener.bind(str(wayland_path))
+            x11_path = Path(directory) / "X0"
+            x11_path.touch()
+            with mock.patch("appsbx.host_display._socket", side_effect=(
+                wayland_path.resolve(), x11_path.resolve(),
+            )):
+                try:
+                    display = detect_host_display({
+                        "XDG_RUNTIME_DIR": str(runtime),
+                        "WAYLAND_DISPLAY": "wayland-0",
+                        "DISPLAY": ":0",
+                    })
+                finally:
+                    wayland_listener.close()
+            self.assertIn(("ELECTRON_OZONE_PLATFORM_HINT", "x11"), display.environment)
+            self.assertIn((x11_path.resolve(), "/tmp/.X11-unix/X0"), display.mounts)
+
+    def test_host_display_rejects_remote_or_missing_display(self):
+        with self.assertRaises(HostDisplayError):
+            detect_host_display({"DISPLAY": "localhost:0"})
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(HostDisplayError):
+                detect_host_display({
+                    "XDG_RUNTIME_DIR": directory,
+                    "WAYLAND_DISPLAY": "wayland-0",
+                })
+
+    def test_host_display_plan_sets_only_validated_display_environment(self):
+        profile = load_profile(EXAMPLE)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            identity = ensure_identity(profile, state)
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state, "host")
+            source = Path(directory) / "wayland-0"
+            source.touch()
+            x11_source = Path(directory) / "X0"
+            x11_source.touch()
+            host = HostDisplay(
+                "wayland",
+                (("WAYLAND_DISPLAY", "wayland-0"), ("XDG_RUNTIME_DIR", "/run/appsbx"),
+                 ("DISPLAY", ":0"), ("ELECTRON_OZONE_PLATFORM_HINT", "x11")),
+                ((source, "/run/appsbx/wayland-0"), (x11_source, "/tmp/.X11-unix/X0")),
+            )
+            plan = prepare_plan(
+                profile, identity, app_root, ["/opt/app/zaap"], "stub", bundle,
+                "host", host_display=host,
+            )
+            self.assertIn(("--ro-bind", str(source), "/run/appsbx/wayland-0"), zip(
+                plan.argv, plan.argv[1:], plan.argv[2:],
+            ))
+            self.assertIn(("--setenv", "WAYLAND_DISPLAY", "wayland-0"), zip(
+                plan.argv, plan.argv[1:], plan.argv[2:],
+            ))
+            self.assertIn(("--setenv", "ELECTRON_OZONE_PLATFORM_HINT", "x11"), zip(
+                plan.argv, plan.argv[1:], plan.argv[2:],
+            ))
+            self.assertIn("--ozone-platform=x11", plan.argv)
+            self.assertIn("--unshare-net", plan.argv)
+            self.assertIn(("--ro-bind", str(x11_source), "/tmp/.X11-unix/X0"), zip(
+                plan.argv, plan.argv[1:], plan.argv[2:],
+            ))
+
+    def test_gui_privilege_backend_uses_pkexec_without_changing_helper(self):
+        with mock.patch.dict("os.environ", {"APPSBX_PRIVILEGE_BACKEND": "pkexec"}, clear=False):
+            with mock.patch("appsbx.runtime.shutil.which", return_value="/usr/bin/pkexec"):
+                with mock.patch("appsbx.runtime.os.geteuid", return_value=1000):
+                    self.assertEqual(_authorization_prefix(), ["/usr/bin/pkexec"])
+
     def test_stub_and_real_network_modes_are_distinct(self):
         profile = load_profile(EXAMPLE)
         with tempfile.TemporaryDirectory() as directory:
@@ -409,7 +711,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("--ro-bind", stub.argv)
             self.assertNotIn("--ro-bind-data", stub.argv)
             self.assertEqual(stub.pass_fds, ())
-            self.assertEqual(len(stub.identity_files), 45)
+            self.assertEqual(len(stub.identity_files), 49)
             self.assertIn("--setenv", stub.argv)
             self.assertIn("FONTCONFIG_FILE", stub.argv)
             self.assertIn("ALSA_CONFIG_PATH", stub.argv)
@@ -436,7 +738,7 @@ class RuntimeTests(unittest.TestCase):
             bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state)
             plan = prepare_plan(profile, identity, app_root, ["/opt/app/zaap"], "real", bundle)
             self.assertEqual(plan.pass_fds, ())
-            self.assertEqual(len(plan.identity_files), 45)
+            self.assertEqual(len(plan.identity_files), 49)
             for destination, source in plan.identity_files.items():
                 self.assertIn(("--ro-bind", str(source), destination), zip(
                     plan.argv, plan.argv[1:], plan.argv[2:]
@@ -456,6 +758,16 @@ class RuntimeTests(unittest.TestCase):
                 "libsoftokn3.so", "libfreebl3.so", "libfreeblpriv3.so",
                 "libnssdbm3.so", "libnssckbi.so",
             ):
+                self.assertTrue(any(path.name == library for path in bundle.root.rglob(library)), library)
+
+    def test_host_runtime_bundle_stages_x11_and_gl_runtime_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state, "host")
+            for library in ("libX11-xcb.so.1", "libEGL.so.1", "libGL.so.1"):
                 self.assertTrue(any(path.name == library for path in bundle.root.rglob(library)), library)
 
     def test_runtime_bundle_contains_profile_controlled_synthetic_df(self):
@@ -499,6 +811,25 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("gio open", body)
             self.assertNotIn("/usr/bin/xdg-open", body)
             self.assertNotIn("--no-sandbox", body)
+
+    def test_private_url_broker_allows_host_display_but_not_headless_launches(self):
+        _validate_url_broker_display("xvfb", True)
+        _validate_url_broker_display("host", True)
+        with self.assertRaises(ELFError):
+            _validate_url_broker_display("none", True)
+
+    def test_downloaded_game_entrypoint_is_scoped_to_private_profile_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            game = state / "home/.config/Ankama/Retro/dofus1electron"
+            game.parent.mkdir(parents=True)
+            shutil.copy2("/bin/true", game)
+            os.chmod(game, 0o755)
+            discovered = _downloaded_game_entrypoint(state)
+            self.assertIsNotNone(discovered)
+            assert discovered is not None
+            self.assertEqual(discovered[0], game.resolve())
+            self.assertRegex(discovered[1], r"^[0-9a-f]+-[0-9a-f]+$")
 
     def test_synthetic_df_rejects_invalid_capacity(self):
         with self.assertRaises(ELFError):
@@ -590,6 +921,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(("--ro-bind", str(display.x11_dir), "/tmp/.X11-unix"), zip(
                 bridge, bridge[1:], bridge[2:],
             ))
+            self.assertIn(("-wait", "20"), zip(bridge, bridge[1:]))
+            self.assertIn(("-deferupdate", "20"), zip(bridge, bridge[1:]))
             self.assertNotIn(str(app_root), bridge)
 
     def test_vnc_controller_is_loopback_only_and_cleans_up(self):

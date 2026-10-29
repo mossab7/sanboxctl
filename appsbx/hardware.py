@@ -16,6 +16,12 @@ from typing import Any
 
 HARDWARE_CLASSES = ("laptop", "desktop", "workstation", "random")
 
+# The synthetic ``df`` helper and the staged /sys block-device view use MiB.
+# Keep automatic identities within this ceiling so identity materialization can
+# never fail after an otherwise valid profile has already been persisted.
+MIN_SYNTHETIC_DISK_MB = 128_000
+MAX_SYNTHETIC_DISK_MB = 1_048_576
+
 
 @dataclass(frozen=True)
 class HardwareProfile:
@@ -87,8 +93,8 @@ CATALOG: tuple[_Variant, ...] = (
     _Variant("laptop", "Lenovo ThinkPad T14 Gen 2 AMD", "AuthenticAMD", "AMD Ryzen 5 PRO 5650U with Radeon Graphics", 25, 80, 0, 6, 12, 2300, 16384, (16384, 32768), "AMD Radeon Graphics", "Lenovo 20XK", "LENOVO", ("R1BET62W", "R1MET62W"), "2023-02-08", (("SAMSUNG MZVLQ512HALU-00BL2", 512000), ("SK hynix PC711", 512000)), "Intel Wi-Fi 6 AX200"),
     _Variant("desktop", "HP EliteDesk 800 G6", "GenuineIntel", "12th Gen Intel(R) Core(TM) i7-12700", 6, 151, 2, 12, 20, 3600, 25600, (16384, 32768, 65536), "Intel UHD Graphics 770", "HP 8906", "HP", ("02.17.00", "02.20.00"), "2023-11-03", (("WD_BLACK SN770", 1000000), ("Samsung SSD 980 PRO", 1000000)), "Intel Ethernet Controller I225-V"),
     _Variant("desktop", "MSI MAG B550 Tomahawk", "AuthenticAMD", "AMD Ryzen 7 5800X 8-Core Processor", 25, 33, 0, 8, 16, 3800, 32768, (16384, 32768, 65536), "NVIDIA GeForce RTX 3060", "MSI MS-7C91", "American Megatrends International", ("A.90", "A.A0"), "2023-08-21", (("Crucial P5 Plus", 1000000), ("SAMSUNG MZ-V8P1T0", 1000000)), "Realtek RTL8125 2.5GbE"),
-    _Variant("workstation", "Lenovo ThinkStation P620", "AuthenticAMD", "AMD Ryzen Threadripper PRO 3955WX 16-Cores", 25, 1, 0, 16, 32, 3900, 65536, (65536, 131072), "NVIDIA RTX A4000", "Lenovo 1036", "LENOVO", ("S07KT1B", "S07KT2B"), "2022-10-14", (("Samsung PM983", 1920000), ("KIOXIA CD6", 1920000)), "Intel Ethernet Connection I219-LM"),
-    _Variant("workstation", "Dell Precision 5820 Tower", "GenuineIntel", "Intel(R) Xeon(R) W-2245 CPU", 6, 85, 7, 8, 16, 3900, 16384, (32768, 65536), "NVIDIA Quadro P2200", "Dell 0F5C5X", "Dell Inc.", ("2.13.0", "2.15.0"), "2022-06-16", (("Intel SSD D3-S4510", 1920000), ("Micron 5300 PRO", 1920000)), "Intel Ethernet I210"),
+    _Variant("workstation", "Lenovo ThinkStation P620", "AuthenticAMD", "AMD Ryzen Threadripper PRO 3955WX 16-Cores", 25, 1, 0, 16, 32, 3900, 65536, (65536, 131072), "NVIDIA RTX A4000", "Lenovo 1036", "LENOVO", ("S07KT1B", "S07KT2B"), "2022-10-14", (("Samsung PM983", 960000), ("KIOXIA CD6", 960000)), "Intel Ethernet Connection I219-LM"),
+    _Variant("workstation", "Dell Precision 5820 Tower", "GenuineIntel", "Intel(R) Xeon(R) W-2245 CPU", 6, 85, 7, 8, 16, 3900, 16384, (32768, 65536), "NVIDIA Quadro P2200", "Dell 0F5C5X", "Dell Inc.", ("2.13.0", "2.15.0"), "2022-06-16", (("Intel SSD D3-S4510", 960000), ("Micron 5300 PRO", 960000)), "Intel Ethernet I210"),
 )
 
 
@@ -115,7 +121,7 @@ def validate_hardware(profile: HardwareProfile) -> None:
         raise ValueError("inconsistent CPU core counts")
     if profile.ram_mb < 4096 or profile.ram_mb % 1024:
         raise ValueError("unrealistic RAM size")
-    if profile.disk_size_mb < 128000:
+    if not MIN_SYNTHETIC_DISK_MB <= profile.disk_size_mb <= MAX_SYNTHETIC_DISK_MB:
         raise ValueError("unrealistic disk size")
     if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", profile.mac):
         raise ValueError("invalid generated MAC")

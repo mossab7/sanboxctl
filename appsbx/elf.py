@@ -20,6 +20,8 @@ import sysconfig
 import tempfile
 from typing import Iterable
 
+from .gpu import GpuInfo
+
 
 class ELFError(ValueError):
     """An executable or dependency is unsupported or cannot be resolved."""
@@ -36,7 +38,8 @@ DT_STRTAB = 5
 DT_STRSZ = 10
 DT_RPATH = 15
 DT_RUNPATH = 29
-BUNDLE_VERSION = 25
+# Bump whenever the staged runtime contract changes.
+BUNDLE_VERSION = 41
 VNC_BUNDLE_VERSION = 1
 GOOGLE_CHROME_ROOT = Path("/opt/google/chrome")
 GOOGLE_CHROME_EXECUTABLE = GOOGLE_CHROME_ROOT / "chrome"
@@ -203,7 +206,7 @@ def _system_search_paths() -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _candidate_source(candidate: Path, app_root: Path) -> tuple[Path, bool] | None:
+def _candidate_source(candidate: Path, payload_roots: Iterable[Path]) -> tuple[Path, bool] | None:
     candidate = candidate.absolute()
     try:
         resolved = candidate.resolve(strict=True)
@@ -211,11 +214,12 @@ def _candidate_source(candidate: Path, app_root: Path) -> tuple[Path, bool] | No
         return None
     if not resolved.is_file():
         return None
-    if _within(candidate, app_root):
-        # An AppDir symlink that escapes into the host is not accepted.
-        if _within(resolved, app_root):
-            return candidate, True
-        return None
+    for payload_root in payload_roots:
+        if _within(candidate, payload_root):
+            # A payload symlink that escapes into the host is not accepted.
+            if _within(resolved, payload_root):
+                return candidate, True
+            return None
     if any(_within(resolved, root) for root in _system_search_paths()):
         # Preserve the lexical library name so a symlink such as libc.so.6 is
         # present at the exact path the dynamic loader will open.
@@ -223,7 +227,16 @@ def _candidate_source(candidate: Path, app_root: Path) -> tuple[Path, bool] | No
     return None
 
 
-def _resolve_dependency(name: str, requester: Path, app_root: Path, search_paths: Iterable[str]) -> tuple[Path, bool] | None:
+def _resolve_dependency(
+    name: str,
+    requester: Path,
+    payload_roots: Iterable[Path],
+    search_paths: Iterable[str],
+) -> tuple[Path, bool] | None:
+    payload_roots = tuple(root.resolve() for root in payload_roots)
+    if not payload_roots:
+        raise ELFError("dependency resolution requires a payload root")
+    app_root = payload_roots[0]
     candidates: list[Path] = []
     if name.startswith("/"):
         candidates.append(app_root / name.lstrip("/"))
@@ -241,7 +254,7 @@ def _resolve_dependency(name: str, requester: Path, app_root: Path, search_paths
         app_root / "usr" / "lib" / name,
         app_root / "usr" / "lib" / str(sysconfig.get_config_var("MULTIARCH") or "") / name,
     ))
-    if not _within(requester, app_root):
+    if not any(_within(requester, root) for root in payload_roots):
         candidates.append(requester.parent / name)
     candidates.extend(base / name for base in _system_search_paths())
     seen: set[Path] = set()
@@ -250,7 +263,7 @@ def _resolve_dependency(name: str, requester: Path, app_root: Path, search_paths
         if candidate in seen:
             continue
         seen.add(candidate)
-        source = _candidate_source(candidate, app_root)
+        source = _candidate_source(candidate, payload_roots)
         if source is not None:
             return source
     return None
@@ -269,6 +282,32 @@ def _entrypoint(app_root: Path, app_command: Iterable[str]) -> Path:
     if not os.access(path, os.X_OK):
         raise ELFError("application executable is not executable")
     return path
+
+
+def _downloaded_game_entrypoint(state_dir: Path) -> tuple[Path, str] | None:
+    """Return the known Zaap Linux child executable if it is safely present.
+
+    Zaap updates this Electron child below its already-private HOME. It is not
+    mounted as a new host path; it is only used to stage its declared system
+    ELF closure into the private runtime bundle.
+    """
+    game_root = state_dir / "home" / ".config" / "Ankama" / "Retro"
+    entrypoint = game_root / "dofus1electron"
+    try:
+        root = game_root.resolve(strict=True)
+        entrypoint = entrypoint.resolve(strict=True)
+        info = entrypoint.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        not _within(root, state_dir.resolve())
+        or not _within(entrypoint, root)
+        or entrypoint.is_symlink()
+        or not entrypoint.is_file()
+        or not os.access(entrypoint, os.X_OK)
+    ):
+        return None
+    return entrypoint, f"{info.st_size:x}-{info.st_mtime_ns:x}"
 
 
 def _stage_host_path(
@@ -572,6 +611,111 @@ def _stage_resource_tree(
                     raise ELFError(f"display data symlink leaves approved roots: {item}")
 
 
+def _write_gpu_sysfs_view(bundle_root: Path, gpu_info: GpuInfo) -> None:
+    """Create a static, GPU-only sysfs compatibility view.
+
+    Mesa/libdrm follows DRM class/device symlinks and reads a handful of PCI
+    attributes.  Binding those host symlinks into a new mount namespace turns
+    them into broken or incorrectly rooted links.  Copy the small read-only
+    metadata set instead, preserving the expected topology but never exposing
+    the host's live sysfs, DMI, CPU, disk, or other PCI devices.
+    """
+    sys_devices = Path("/sys/devices")
+    try:
+        relative_device = gpu_info.sysfs_device.relative_to(sys_devices)
+        relative_render = gpu_info.sysfs_render_node.relative_to(sys_devices)
+    except ValueError as exc:
+        raise ELFError("GPU sysfs device is outside /sys/devices") from exc
+    if relative_render != relative_device / "drm" / gpu_info.render_node.name:
+        raise ELFError("GPU sysfs render node is not below its selected device")
+
+    def destination(path: Path) -> Path:
+        # ``bundle_root/sys`` is the synthetic namespace's /sys root.
+        return bundle_root / "sys" / path.relative_to("/sys")
+
+    device_destination = destination(gpu_info.sysfs_device)
+    device_destination.mkdir(parents=True, exist_ok=True, mode=0o755)
+    # These values identify the selected GPU to Mesa.  They are intentionally
+    # not a general PCI or motherboard inventory.
+    for name in ("vendor", "device", "subsystem_vendor", "subsystem_device",
+                 "revision", "class", "uevent", "modalias", "boot_vga"):
+        source = gpu_info.sysfs_device / name
+        if source.is_file():
+            target = device_destination / name
+            target.write_bytes(source.read_bytes()[:64 * 1024])
+    # Mesa/libdrm uses the PCI config header while identifying the render
+    # device. It is binary data, so expose only the first 64 bytes needed for
+    # enumeration.
+    config = gpu_info.sysfs_device / "config"
+    if config.is_file():
+        # Expose only the immutable identification portion of the PCI header.
+        # BARs and the capability pointer are host address/topology data and
+        # are not needed by Mesa for render-node identification.
+        config_bytes = bytearray(config.read_bytes()[:64])
+        if len(config_bytes) != 64:
+            raise ELFError("selected GPU PCI config is shorter than 64 bytes")
+        config_bytes[0x10:0x28] = b"\0" * (0x28 - 0x10)
+        config_bytes[0x34] = 0
+        target = device_destination / "config"
+        target.write_bytes(config_bytes)
+        target.chmod(0o444)
+    else:
+        raise ELFError("selected GPU PCI config is unavailable")
+    (device_destination / "driver").symlink_to(
+        "/sys/bus/pci/drivers/" + gpu_info.kernel_driver
+    )
+    (device_destination / "subsystem").symlink_to("/sys/bus/pci")
+
+    render_destination = destination(gpu_info.sysfs_render_node)
+    render_destination.mkdir(parents=True, exist_ok=True, mode=0o755)
+    for name in ("dev", "uevent"):
+        source = gpu_info.sysfs_render_node / name
+        if source.is_file():
+            (render_destination / name).write_bytes(source.read_bytes()[:64 * 1024])
+    # Match the kernel sysfs topology. This resolves from the render node
+    # directory back to the selected PCI device.
+    (render_destination / "device").symlink_to("../../../" + gpu_info.sysfs_device.name)
+    (render_destination / "subsystem").symlink_to("/sys/class/drm")
+    class_destination = bundle_root / "sys" / "class" / "drm" / gpu_info.render_node.name
+    class_destination.mkdir(parents=True, exist_ok=True, mode=0o755)
+    for name in ("dev", "uevent"):
+        source = gpu_info.sysfs_render_node / name
+        if source.is_file():
+            (class_destination / name).write_bytes(source.read_bytes()[:64 * 1024])
+    # The DRM class entry points back to the single staged PCI device.
+    (class_destination / "device").symlink_to("/sys/devices/" + str(relative_device))
+    dev_destination = bundle_root / "sys" / "dev" / "char"
+    dev_destination.mkdir(parents=True, exist_ok=True, mode=0o755)
+    device_number = gpu_info.render_node.stat().st_rdev
+    dev_node = dev_destination / f"{os.major(device_number)}:{os.minor(device_number)}"
+    dev_node.mkdir(parents=True, exist_ok=True, mode=0o755)
+    for name in ("dev", "uevent"):
+        source = gpu_info.sysfs_render_node / name
+        if source.is_file():
+            (dev_node / name).write_bytes(source.read_bytes()[:64 * 1024])
+    # The devchar entry itself is not mounted. runtime.py creates the
+    # kernel-style symlink with bwrap --symlink.
+    driver_destination = bundle_root / "sys" / "bus" / "pci" / "drivers" / gpu_info.kernel_driver
+    driver_destination.mkdir(parents=True, exist_ok=True, mode=0o755)
+    (driver_destination / gpu_info.sysfs_device.name).symlink_to(
+        "/sys/devices/" + str(relative_device)
+    )
+    # libdrm/libudev uses this small device database record when resolving a
+    # render node.  Generate only stable GPU topology fields; do not copy the
+    # host udev database or its unrelated device records.
+    device_number = gpu_info.render_node.stat().st_rdev
+    udev_data = bundle_root / "run" / "udev" / "data"
+    udev_data.mkdir(parents=True, exist_ok=True, mode=0o755)
+    (udev_data / f"c{os.major(device_number)}:{os.minor(device_number)}").write_text(
+        f"S:dri/by-path/pci-{gpu_info.sysfs_device.name}-render\\n"
+        f"E:ID_PATH=pci-{gpu_info.sysfs_device.name}\\n"
+        f"E:ID_PATH_TAG=pci-{gpu_info.sysfs_device.name.replace(':', '_').replace('.', '_')}\\n"
+        f"E:ID_FOR_SEAT=drm-pci-{gpu_info.sysfs_device.name.replace(':', '_').replace('.', '_')}\\n"
+        "G:seat\\nV:1\\n",
+        encoding="ascii",
+    )
+
+
 def synthetic_df_script(disk_mb: int) -> str:
     """Return the private, deterministic ``df`` compatibility command.
 
@@ -601,6 +745,12 @@ printf '%s\\n' 'appsbxfs {blocks} 0 {blocks} 0% /home/appsbx'
 """
 
 
+def _validate_url_broker_display(display_backend: str, url_broker: bool) -> None:
+    """Keep authentication browsing inside a display-visible sandbox only."""
+    if url_broker and display_backend not in {"xvfb", "host"}:
+        raise ELFError("private URL broker requires a visible sandbox display backend")
+
+
 def prepare_runtime_bundle(
     app_root: Path,
     app_command: Iterable[str],
@@ -608,23 +758,33 @@ def prepare_runtime_bundle(
     display_backend: str = "none",
     synthetic_disk_mb: int = 102_400,
     url_broker: bool = False,
+    gpu_info: GpuInfo | None = None,
 ) -> RuntimeBundle:
     """Stage the executable closure and private compatibility helpers."""
-    if display_backend not in {"none", "xvfb"}:
-        raise ELFError("display backend must be none or xvfb")
-    if url_broker and display_backend != "xvfb":
-        raise ELFError("private URL broker requires the private Xvfb display backend")
+    if display_backend not in {"none", "xvfb", "host"}:
+        raise ELFError("display backend must be none, xvfb, or host")
+    _validate_url_broker_display(display_backend, url_broker)
+    if gpu_info is not None and display_backend != "host":
+        raise ELFError("hardware GPU runtime requires the host display backend")
     df_script = synthetic_df_script(synthetic_disk_mb)
     app_root = app_root.resolve()
     entrypoint = _entrypoint(app_root, app_command)
+    game_entry = _downloaded_game_entrypoint(state_dir)
+    payload_roots = [app_root]
+    game_key = "nogame"
+    if game_entry is not None:
+        game_entrypoint, game_stamp = game_entry
+        payload_roots.append(game_entrypoint.parent)
+        game_key = f"game-{game_stamp}"
     display_executable = _display_executable() if display_backend == "xvfb" else None
     if display_backend == "xvfb" and display_executable is None:
         raise ELFError("display backend xvfb requested, but /usr/bin/Xvfb is not installed")
     browser_executable = _private_browser_source() if url_broker else None
     key = hashlib.sha256(entrypoint.read_bytes()).hexdigest()[:20]
-    display_key = "xvfb" if display_executable else "nodisplay"
+    display_key = "xvfb" if display_executable else ("host" if display_backend == "host" else "nodisplay")
+    gpu_key = f"gpu-{gpu_info.mesa_driver}" if gpu_info is not None else "gpu-none"
     broker_key = "browser" if browser_executable is not None else "nobrowser"
-    bundle_root = state_dir / f"runtime-v{BUNDLE_VERSION}-{key}-{display_key}-{broker_key}-disk{synthetic_disk_mb}"
+    bundle_root = state_dir / f"runtime-v{BUNDLE_VERSION}-{key}-{game_key}-{display_key}-{gpu_key}-{broker_key}-disk{synthetic_disk_mb}"
     manifest = bundle_root / "manifest.json"
     if manifest.exists():
         try:
@@ -635,6 +795,8 @@ def prepare_runtime_bundle(
                 and data.get("display_backend") == display_backend
                 and data.get("synthetic_disk_mb") == synthetic_disk_mb
                 and data.get("url_broker") == url_broker
+                and data.get("gpu_driver") == (gpu_info.mesa_driver if gpu_info else None)
+                and data.get("game_runtime") == game_key
             ):
                 script = bundle_root / "usr" / "bin" / "appsbx-xvfb-exec"
                 if display_backend == "xvfb" and not script.is_file():
@@ -662,6 +824,8 @@ def prepare_runtime_bundle(
     staged: set[Path] = set()
     visited: set[Path] = set()
     queue = [entrypoint]
+    if game_entry is not None:
+        queue.append(game_entry[0])
     helpers: list[Path] = []
     try:
         # Electron's Linux protocol-registration path launches xdg-settings
@@ -689,12 +853,12 @@ def prepare_runtime_bundle(
                 raise ELFError(f"required NSS runtime module is unavailable: {library_name}")
             _stage_host_path(library, temporary, staged)
             queue.append(library)
-        if display_executable is not None:
+        if display_executable is not None or display_backend == "host":
             # Xvfb is launched inside the same bubblewrap root.  The shell and
             # helper tools are staged explicitly because the sandbox does not
             # mount the host /bin or /usr wholesale.
-            helpers = [
-                display_executable, Path("/usr/bin/sleep"),
+            helpers = ([display_executable] if display_executable is not None else []) + [
+                Path("/usr/bin/sleep"),
                 Path("/usr/bin/cat"), Path("/usr/bin/mkdir"),
                 Path("/usr/bin/chmod"), Path("/usr/bin/setpriv"),
                 Path("/usr/bin/xkbcomp"), Path("/usr/bin/head"),
@@ -715,14 +879,43 @@ def prepare_runtime_bundle(
             for library_name in (
                 "libX11-xcb.so.1", "libudev.so.1", "libva.so.2",
                 "libva-x11.so.2", "libva-drm.so.2",
-                "libdrm.so.2", "libEGL.so.1", "libGLX.so.0",
-                "libGLdispatch.so.0", "libgbm.so.1", "libvulkan.so.1",
+                "libdrm.so.2", "libEGL.so.1", "libGL.so.1", "libGLX.so.0",
+                "libEGL_mesa.so.0", "libGLX_mesa.so.0", "libGLESv2.so.2",
+                "libOpenGL.so.0", "libGLdispatch.so.0",
+                "libgbm.so.1", "libvulkan.so.1",
             ):
                 library = _find_system_library(library_name)
                 if library is None:
                     raise ELFError(f"required display library is unavailable: {library_name}")
                 _stage_host_path(library, temporary, staged)
                 queue.append(library)
+            if gpu_info is not None:
+                _stage_host_path(gpu_info.driver_library, temporary, staged)
+                queue.append(gpu_info.driver_library)
+                # Xwayland's GLX path may request the legacy Intel DRI name
+                # even when EGL/Mesa maps i915 to iris. Keep the alias in the
+                # private bundle; do not expose the host DRI directory.
+                if gpu_info.kernel_driver == "i915":
+                    legacy_intel = gpu_info.driver_library.with_name("i915_dri.so")
+                    if legacy_intel.is_file():
+                        _stage_host_path(legacy_intel, temporary, staged)
+                        queue.append(legacy_intel)
+                # GTK/Electron may load GDK-pixbuf modules after startup.
+                # Keep the loader cache and modules inside the private
+                # runtime; never allow a host /usr/lib fallback.
+                pixbuf = _find_system_library("libgdk_pixbuf-2.0.so.0")
+                if pixbuf is not None:
+                    _stage_host_path(pixbuf, temporary, staged)
+                    queue.append(pixbuf)
+                else:
+                    raise ELFError("required GTK runtime library is unavailable: libgdk_pixbuf-2.0.so.0")
+                pixbuf_dir = Path("/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0")
+                pixbuf_loaders = pixbuf_dir / "loaders"
+                if pixbuf_loaders.is_dir():
+                    _stage_resource_tree(pixbuf_loaders, temporary, SYSTEM_LIBRARY_ROOTS)
+                pixbuf_cache = pixbuf_dir / "loaders.cache"
+                if pixbuf_cache.is_file():
+                    _stage_regular_file(pixbuf_cache, temporary, SYSTEM_LIBRARY_ROOTS)
             resource_roots = (Path("/usr/share/X11"), Path("/usr/share/fonts"))
             _stage_resource_tree(Path("/usr/share/X11/xkb"), temporary, resource_roots)
             for resource in (Path("/usr/share/X11/locale"), Path("/usr/share/fonts/X11/misc")):
@@ -747,7 +940,15 @@ def prepare_runtime_bundle(
                     _stage_resource_tree(resource, temporary, data_roots)
                 elif resource.is_file():
                     _stage_regular_file(resource, temporary, data_roots)
+            # Native Wayland/GTK initialization asks GDK-pixbuf to load its
+            # standard missing-image icon.  This small fixed icon subset is
+            # data-only and does not expose the host desktop or credentials.
+            adwaita_status = Path("/usr/share/icons/Adwaita/48x48/status")
+            if adwaita_status.is_dir():
+                _stage_resource_tree(adwaita_status, temporary, (Path("/usr/share/icons"),))
             queue.extend(helpers)
+        if gpu_info is not None:
+            _write_gpu_sysfs_view(temporary, gpu_info)
         _write_private_xdg_settings(temporary)
         staged_browser = None
         if browser_executable is not None:
@@ -768,7 +969,7 @@ def prepare_runtime_bundle(
                 if info.interpreter:
                     names.append(info.interpreter)
                 for name in names:
-                    dependency = _resolve_dependency(name, current, GOOGLE_CHROME_ROOT, info.search_paths)
+                    dependency = _resolve_dependency(name, current, (GOOGLE_CHROME_ROOT,), info.search_paths)
                     if dependency is None:
                         raise ELFError(f"unresolved private-browser dependency: {name}")
                     source, is_browser_file = dependency
@@ -792,7 +993,7 @@ def prepare_runtime_bundle(
             if info.interpreter:
                 names.append(info.interpreter)
             for name in names:
-                dependency = _resolve_dependency(name, current, app_root, info.search_paths)
+                dependency = _resolve_dependency(name, current, payload_roots, info.search_paths)
                 if dependency is None:
                     raise ELFError(f"unresolved ELF dependency: {name}")
                 source, is_app_file = dependency
@@ -855,6 +1056,8 @@ exit 111
             "display_backend": display_backend,
             "synthetic_disk_mb": synthetic_disk_mb,
             "url_broker": url_broker,
+            "gpu_driver": gpu_info.mesa_driver if gpu_info else None,
+            "game_runtime": game_key,
         }, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, bundle_root)
     except Exception:

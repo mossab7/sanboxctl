@@ -5,10 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import signal
+import shutil
+import stat
 import subprocess
 from typing import Sequence
 
 from .elf import RuntimeBundle, VNCBundle
+from .host_display import HostDisplay
+from .gpu import GpuInfo
 from .identity import Identity, ensure_profile_home
 from .network import NetworkPlan
 from .profile import Profile
@@ -37,6 +42,8 @@ IDENTITY_DESTINATIONS = (
     "/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name",
     "/sys/class/dmi/id/product_version", "/sys/class/dmi/id/board_vendor",
     "/sys/class/dmi/id/board_name", "/sys/class/dmi/id/bios_vendor",
+    "/sys/class/dmi/id/product_serial", "/sys/class/dmi/id/product_uuid",
+    "/sys/class/dmi/id/board_serial", "/sys/class/dmi/id/chassis_serial",
     "/sys/class/dmi/id/bios_version", "/sys/class/dmi/id/bios_date",
     "/sys/block/vda/device/model", "/sys/block/vda/device/serial", "/sys/block/vda/size",
 )
@@ -95,6 +102,19 @@ def _runtime_mount_args(runtime_root: Path) -> list[str]:
     return mounts
 
 
+def _validate_gpu_render_node(path: Path) -> None:
+    """Reject a caller-supplied GPU path unless it is a DRM render node."""
+    if path.parent != Path("/dev/dri") or not path.name.startswith("renderD"):
+        raise ValueError("GPU device must be a /dev/dri/renderD* node")
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("GPU render node is unavailable") from exc
+    if (path.is_symlink() or not stat.S_ISCHR(info.st_mode)
+            or os.major(info.st_rdev) != 226 or os.minor(info.st_rdev) < 128):
+        raise ValueError("GPU device is not a DRM render node")
+
+
 def _compatibility_mount_args(runtime_root: Path) -> list[str]:
     """Mount generated compatibility policy, never host desktop settings."""
     policies = (
@@ -126,11 +146,26 @@ def prepare_plan(
     resolv_conf: Path | None = None,
     display_socket_dir: Path | None = None,
     display_number: int = 99,
+    host_display: HostDisplay | None = None,
+    gpu_mode: str = "auto",
+    gpu_info: GpuInfo | None = None,
 ) -> LaunchPlan:
     if network_mode not in {"stub", "real"}:
         raise ValueError("network_mode must be stub or real")
-    if display_backend not in {"none", "xvfb"}:
-        raise ValueError("display_backend must be none or xvfb")
+    if display_backend not in {"none", "xvfb", "host"}:
+        raise ValueError("display_backend must be none, xvfb, or host")
+    if display_backend == "host" and host_display is None:
+        raise ValueError("host display backend requires validated host display bindings")
+    if display_backend != "host" and host_display is not None:
+        raise ValueError("host display bindings require the host display backend")
+    if gpu_mode not in {"auto", "software", "hardware"}:
+        raise ValueError("gpu_mode must be auto, software, or hardware")
+    if gpu_mode == "hardware" and (display_backend != "host" or gpu_info is None):
+        raise ValueError("hardware GPU mode requires a validated host display and render node")
+    if gpu_mode != "hardware" and gpu_info is not None:
+        raise ValueError("GPU information is only valid in hardware mode")
+    if gpu_info is not None:
+        _validate_gpu_render_node(gpu_info.render_node)
     if not 0 <= display_number <= 65_535:
         raise ValueError("private X display number is invalid")
     if not app_command:
@@ -177,6 +212,57 @@ def prepare_plan(
     if network_mode == "stub":
         argv.append("--unshare-net")
     argv.extend(_dest_parent_args(identity.cpu_count))
+    if display_backend == "host" and host_display is not None:
+        if any(destination.startswith("/tmp/.X11-unix/") for _source, destination in host_display.mounts):
+            argv.extend(["--dir", "/tmp/.X11-unix"])
+    if gpu_info is not None:
+        # A render node is the least-privileged DRM interface. No card node or
+        # DRM control device is exposed; only the selected GPU's static PCI
+        # metadata and one generated udev record are made visible.
+        device = gpu_info.render_node.stat().st_rdev
+        dev_char = f"/sys/dev/char/{os.major(device)}:{os.minor(device)}"
+        # sysfs exposes these paths as symlinks. The private namespace needs
+        # the links recreated with sandbox-local targets so Mesa can follow
+        # the DRM class object back to the staged PCI metadata.
+        device_parent = gpu_info.sysfs_device.parent
+        device_parent_args: list[str] = []
+        cursor = Path("/sys/devices")
+        for component in device_parent.relative_to(Path("/sys/devices")).parts:
+            cursor /= component
+            device_parent_args.extend(["--dir", str(cursor)])
+        synthetic_sys = runtime_bundle.root / "sys"
+        if not synthetic_sys.is_dir():
+            raise ValueError("hardware GPU runtime is missing its synthetic sysfs view")
+        synthetic_device = synthetic_sys / gpu_info.sysfs_device.relative_to("/sys")
+        synthetic_render = synthetic_sys / gpu_info.sysfs_render_node.relative_to("/sys")
+        synthetic_class = synthetic_sys / "class" / "drm" / gpu_info.render_node.name
+        synthetic_driver = synthetic_sys / "bus" / "pci" / "drivers" / gpu_info.kernel_driver
+        if not all(path.exists() or path.is_symlink() for path in
+                   (synthetic_device, synthetic_render, synthetic_class, synthetic_driver)):
+            raise ValueError("hardware GPU runtime has an incomplete synthetic sysfs view")
+        argv.extend([
+            "--dir", "/dev/dri", "--dev-bind", str(gpu_info.render_node), str(gpu_info.render_node),
+            # Mesa's DRM loader needs PCI metadata to associate the render fd
+            # with the selected DRI module. This is the only host sysfs data
+            # exposed in hardware mode.
+            "--dir", "/sys/dev", "--dir", "/sys/dev/char",
+            "--dir", "/sys/devices", *device_parent_args,
+            "--dir", "/sys/class", "--dir", "/sys/class/drm",
+            "--dir", "/sys/bus", "--dir", "/sys/bus/pci",
+            "--dir", "/sys/bus/pci/drivers", "--dir",
+            f"/sys/bus/pci/drivers/{gpu_info.kernel_driver}",
+            "--ro-bind", str(synthetic_device), str(gpu_info.sysfs_device),
+            "--ro-bind", str(synthetic_render), str(gpu_info.sysfs_render_node),
+            "--ro-bind", str(synthetic_class), f"/sys/class/drm/{gpu_info.render_node.name}",
+            # Preserve the kernel-style devchar symlink instead of exposing a
+            # copied directory. The target is sandbox-local.
+            "--symlink", f"../../devices/{gpu_info.sysfs_device.relative_to('/sys/devices')}/drm/{gpu_info.render_node.name}", dev_char,
+            "--ro-bind", str(synthetic_driver), f"/sys/bus/pci/drivers/{gpu_info.kernel_driver}",
+            "--dir", "/run/udev", "--dir", "/run/udev/data",
+            "--ro-bind", str(runtime_bundle.root / "run" / "udev" / "data" /
+                              f"c{os.major(device)}:{os.minor(device)}"),
+            f"/run/udev/data/c{os.major(device)}:{os.minor(device)}",
+        ])
     if socket_dir is not None:
         # This is a per-run, owner-only directory created by display.py. It
         # contains only the sandbox's Xvfb socket; no host X11 socket is ever
@@ -190,6 +276,9 @@ def prepare_plan(
     # generated reports; mountinfo exposure remains a documented residual until
     # the pinned minimal-rootfs backend is implemented.
     argv.extend(["--ro-bind", str(app_root), "/opt/app"])
+    if host_display is not None:
+        for source, destination in host_display.mounts:
+            argv.extend(["--ro-bind", str(source), destination])
     argv.extend([
         # The one writable host-backed directory is the controller-created,
         # profile-private home. It starts empty and never contains copied host
@@ -226,6 +315,32 @@ def prepare_plan(
             "--setenv", "LIBGL_ALWAYS_SOFTWARE", "1",
         ]
         argv.extend(["/usr/bin/appsbx-xvfb-exec", *app_command])
+    elif display_backend == "host":
+        separator = argv.index("--")
+        display_args: list[str] = []
+        display_names = {name for name, _value in host_display.environment}
+        for name, value in host_display.environment:
+            display_args.extend(["--setenv", name, value])
+        if "ELECTRON_OZONE_PLATFORM_HINT" not in display_names:
+            display_args.extend(["--setenv", "ELECTRON_OZONE_PLATFORM_HINT", "auto"])
+        if gpu_info is not None:
+            display_args.extend([
+                "--setenv", "LIBGL_DRIVERS_PATH", "/usr/lib/x86_64-linux-gnu/dri",
+            ])
+        argv[separator:separator] = display_args
+        host_command = list(app_command)
+        if (
+            "DISPLAY" in display_names
+            and any(name == "ELECTRON_OZONE_PLATFORM_HINT" and value == "x11"
+                    for name, value in host_display.environment)
+            and not any(argument == "--ozone-platform" or argument.startswith("--ozone-platform=")
+                        for argument in host_command[1:])
+        ):
+            # Electron 16 may ignore the environment hint and still attempt
+            # native Wayland initialization. An explicit CLI selection keeps
+            # the legacy packaged build on the validated Xwayland socket.
+            host_command.append("--ozone-platform=x11")
+        argv.extend(host_command)
     else:
         argv.extend(app_command)
 
@@ -301,8 +416,27 @@ def build_vnc_bridge_command(
         "--setenv", "DISPLAY", f":{display_number}", "--",
         server_path, "-display", f":{display_number}", "-inetd", "-nopw",
         "-noshm", "-noxrecord", "-noxfixes", "-noxdamage",
+        # Batch VNC damage updates to reduce encoding overhead on Xvfb.
+        "-wait", "20", "-deferupdate", "20",
     ])
     return argv
+
+
+def _authorization_prefix() -> list[str]:
+    """Return the host authorization wrapper for the restricted helper."""
+    if os.geteuid() == 0:
+        return []
+    backend = os.environ.get("APPSBX_PRIVILEGE_BACKEND", "sudo")
+    if backend == "pkexec":
+        pkexec = shutil.which("pkexec")
+        if pkexec is None:
+            raise ValueError(
+                "GUI real networking requires pkexec and a desktop authorization agent"
+            )
+        return [pkexec]
+    if backend == "sudo":
+        return ["sudo"]
+    raise ValueError("unsupported privilege authorization backend")
 
 
 def _execution_command(plan: LaunchPlan) -> list[str]:
@@ -333,32 +467,89 @@ def _execution_command(plan: LaunchPlan) -> list[str]:
     for server in definition.dns_servers:
         command.extend(["--dns", str(server)])
     command.extend(["--", *plan.argv])
-    if os.geteuid() != 0:
-        # The helper is root-owned and independently validates the Bubblewrap
-        # command. Allow the normal sudo authentication prompt; deployments
-        # may replace this with a narrowly scoped NOPASSWD rule.
-        command = ["sudo", *command]
+    # The helper is root-owned and independently validates the Bubblewrap
+    # command. CLI launches use sudo; the GUI sets pkexec so authorization is
+    # handled by the desktop policy agent instead of a nonexistent QProcess
+    # terminal. Neither path grants the application root access.
+    command = [*_authorization_prefix(), *command]
     return command
 
 
 def execute(plan: LaunchPlan, vnc_service=None) -> int:
-    """Execute a plan, optionally presenting its private Xvfb via VNC."""
+    """Execute a plan in a killable process group.
+
+    The process-group boundary is required for both display backends. Host
+    display mode has no VNC service, but Electron still creates GPU, renderer,
+    utility, and child processes that must not survive a GUI stop or exit.
+    """
     command = _execution_command(plan)
-    if vnc_service is None:
-        return subprocess.call(command, env=_minimal_host_env(), pass_fds=())
-    vnc_service.start()
     process: subprocess.Popen[object] | None = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    sudo_cli = bool(command and command[0] == "sudo")
+
+    def stop_child_on_parent_termination(signum, _frame):
+        if process is not None and process.poll() is None:
+            if sudo_cli:
+                # The sudo process remains in the foreground terminal
+                # session so it can prompt. Signal it directly; it forwards
+                # termination to the root helper and its Bubblewrap child.
+                process.send_signal(signum)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    process.terminate()
+        raise SystemExit(128 + signum)
+
     try:
-        process = subprocess.Popen(command, env=_minimal_host_env(), pass_fds=())
-        vnc_service.wait_for_xvfb(process)
-        vnc_service.open_viewer()
+        if vnc_service is not None:
+            vnc_service.start()
+        # Keep the helper, Bubblewrap, Xvfb, and Electron in one process group
+        # so a GUI shutdown cannot leave a helper or application orphan.
+        # sudo's default timestamp policy may be TTY-bound. ``setsid`` (used
+        # by start_new_session) would remove the controlling terminal before
+        # sudo can validate or refresh that ticket. A CLI sudo launch instead
+        # creates a new process group while retaining the existing session;
+        # pkexec and direct launches keep the stronger detached-session path.
+        if sudo_cli and not os.isatty(0):
+            raise ValueError(
+                "sudo real-network launches require a terminal; run sandboxctl "
+                "from a terminal or use APPSBX_PRIVILEGE_BACKEND=pkexec"
+            )
+        process = subprocess.Popen(
+            command, env=_minimal_host_env(), pass_fds=(),
+            # sudo must retain the foreground terminal for password prompts.
+            # Direct and pkexec launches still receive an independent session.
+            start_new_session=not sudo_cli,
+        )
+        signal.signal(signal.SIGTERM, stop_child_on_parent_termination)
+        signal.signal(signal.SIGINT, stop_child_on_parent_termination)
+        if vnc_service is not None:
+            vnc_service.wait_for_xvfb(process)
+            vnc_service.open_viewer()
         return process.wait()
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
         if process is not None and process.poll() is None:
-            process.terminate()
+            if sudo_cli:
+                process.terminate()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    process.terminate()
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                process.kill()
+                if sudo_cli:
+                    process.kill()
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        process.kill()
                 process.wait(timeout=3)
-        vnc_service.stop()
+        if vnc_service is not None:
+            vnc_service.stop()

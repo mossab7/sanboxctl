@@ -32,6 +32,9 @@ fi
 if [[ -n "${APPSBX_APP_ROOT:-}" ]]; then
     run_capture run-plan "$ROOT/sandboxctl" run --profile example --mode stub \
         --app-root "$APPSBX_APP_ROOT" -- /opt/app/zaap
+else
+    run_capture run-plan "$ROOT/sandboxctl" run --profile example --mode stub \
+        -- /opt/app/zaap
 fi
 
 printf '%s\n' "$OUT"

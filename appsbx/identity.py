@@ -10,7 +10,12 @@ import secrets
 import tempfile
 import uuid
 
-from .hardware import HardwareProfile, generate_hardware, legacy_hardware
+from .hardware import (
+    MAX_SYNTHETIC_DISK_MB,
+    HardwareProfile,
+    generate_hardware,
+    legacy_hardware,
+)
 from .profile import Profile, ProfileError
 
 
@@ -92,6 +97,10 @@ class Identity:
             "/sys/class/dmi/id/product_version": self.files_dir / "dmi-product-version",
             "/sys/class/dmi/id/board_vendor": self.files_dir / "dmi-board-vendor",
             "/sys/class/dmi/id/board_name": self.files_dir / "dmi-board-name",
+            "/sys/class/dmi/id/product_serial": self.files_dir / "dmi-product-serial",
+            "/sys/class/dmi/id/product_uuid": self.files_dir / "dmi-product-uuid",
+            "/sys/class/dmi/id/board_serial": self.files_dir / "dmi-board-serial",
+            "/sys/class/dmi/id/chassis_serial": self.files_dir / "dmi-chassis-serial",
             "/sys/class/dmi/id/bios_vendor": self.files_dir / "dmi-bios-vendor",
             "/sys/class/dmi/id/bios_version": self.files_dir / "dmi-bios-version",
             "/sys/class/dmi/id/bios_date": self.files_dir / "dmi-bios-date",
@@ -225,6 +234,10 @@ def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
         "dmi-product-version": "appsbx virtual platform\n",
         "dmi-board-vendor": identity.hardware.bios_vendor + "\n",
         "dmi-board-name": identity.hardware.motherboard + "\n",
+        "dmi-product-serial": "APP-" + identity.machine_id[:12].upper() + "\n",
+        "dmi-product-uuid": identity.boot_id + "\n",
+        "dmi-board-serial": "BRD-" + identity.machine_id[12:24].upper() + "\n",
+        "dmi-chassis-serial": "CHS-" + identity.machine_id[24:].upper() + "\n",
         "dmi-bios-vendor": identity.hardware.bios_vendor + "\n",
         "dmi-bios-version": identity.hardware.bios_version + "\n",
         "dmi-bios-date": identity.hardware.bios_date + "\n",
@@ -361,6 +374,79 @@ def create_auto_identity(profile: Profile, state_root: Path, hardware_class: str
         ensure_profile_home(identity)
         return identity
     raise ProfileError("could not allocate a unique automatic identity state directory")
+
+
+def ensure_generated_identity(profile: Profile, state_dir: Path, hardware_class: str = "random") -> Identity:
+    """Create or reload one persistent generated identity at an exact path.
+
+    This is used by the desktop controller, which owns a directory per named
+    instance rather than the CLI's one-shot automatic identity directories.
+    """
+    if hardware_class not in ("laptop", "desktop", "workstation", "random"):
+        raise ProfileError("invalid hardware class")
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(state_dir, 0o700)
+    identity_path = state_dir / "identity.json"
+    if identity_path.exists():
+        try:
+            data = json.loads(identity_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ProfileError("invalid generated identity") from exc
+        data = _migrate_oversized_generated_disk(data, identity_path)
+        identity = _identity_from_json(data, profile, state_dir)
+    else:
+        identity = _new_identity(profile, state_dir, generate_hardware(hardware_class))
+        _atomic_text(identity_path, json.dumps({
+            "version": 2,
+            "identity_mode": "auto",
+            "profile_name": identity.profile_name,
+            "profile_id": profile.profile_id,
+            "machine_id": identity.machine_id,
+            "boot_id": identity.boot_id,
+            "runtime_uid": identity.runtime_uid,
+            "runtime_gid": identity.runtime_gid,
+            "hardware": identity.hardware.to_dict(),
+        }, sort_keys=True, indent=2) + "\n")
+    return _materialize_generated_identity(identity, profile)
+
+
+def _migrate_oversized_generated_disk(data: dict, identity_path: Path) -> dict:
+    """Repair the one oversized disk value emitted by catalog versions <= 41.
+
+    The old workstation variants persisted 1,920,000 MiB even though the
+    sandbox's synthetic df implementation deliberately supports at most
+    1,048,576 MiB.  These identities never launched successfully, so reducing
+    only their disk capacity to a plausible 960 GB preserves every stable
+    identity attribute while making /sys and df internally consistent.
+    """
+    hardware = data.get("hardware")
+    if (
+        data.get("identity_mode") != "auto"
+        or not isinstance(hardware, dict)
+        or hardware.get("disk_size_mb") != 1_920_000
+    ):
+        return data
+    migrated = dict(data)
+    migrated_hardware = dict(hardware)
+    migrated_hardware["disk_size_mb"] = min(960_000, MAX_SYNTHETIC_DISK_MB)
+    migrated["hardware"] = migrated_hardware
+    _atomic_text(identity_path, json.dumps(migrated, sort_keys=True, indent=2) + "\n")
+    return migrated
+
+
+def _materialize_generated_identity(identity: Identity, profile: Profile) -> Identity:
+    files_dir = identity.files_dir
+    files_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for key, value in _render_files(identity, profile).items():
+        target = files_dir / key
+        try:
+            current = target.read_text(encoding="utf-8")
+        except (FileNotFoundError, UnicodeDecodeError, OSError):
+            current = None
+        if current != value:
+            _atomic_text(target, value)
+    ensure_profile_home(identity)
+    return identity
 
 
 def identity_report(identity: Identity) -> dict:

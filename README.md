@@ -6,6 +6,51 @@ a separately installed, root-owned network helper for only the namespace,
 veth, routing, and firewall operations; this checkout does not install or
 invoke that helper automatically.
 
+## Install on another Linux machine
+
+The portable release contains the existing x86-64 Zaap AppDir and the
+unchanged sandbox engine. It supports Linux hosts with Python 3.10+, a
+supported package manager (`apt`, `dnf`, `pacman`, or `zypper`), and an x86-64
+CPU. It does not download Zaap from a third party: the distributor must supply
+the bundled `apps/zaap.AppDir` payload they are permitted to distribute.
+
+Extract the release, inspect the machine and planned packages, then install:
+
+```bash
+./install.sh check
+./install.sh plan
+./install.sh --yes
+appsbx-gui
+```
+
+`--yes` is intentionally required before the installer invokes the system
+package manager or installs the root-owned, narrowly validated real-network
+helper. The GUI and app files are installed per user below
+`$XDG_DATA_HOME/appsbx/app` (normally `~/.local/share/appsbx/app`); mutable
+profiles, logs, game downloads, and credentials remain below
+`$XDG_STATE_HOME/appsbx` (normally `~/.local/state/appsbx`) with owner-only
+permissions. The installer writes a desktop launcher in
+`$XDG_DATA_HOME/applications` and an `appsbx-gui` launcher in
+`$XDG_BIN_HOME`/`~/.local/bin`.
+
+For a dry-run that makes no changes:
+
+```bash
+./install.sh --dry-run --skip-system-packages --skip-network-helper
+```
+
+Use `./install.sh --update --yes` to replace installed code while retaining
+state. Use `python3 -m appsbx.install uninstall` to remove installed code; add
+`--purge-state` only when intentionally deleting every persistent profile and
+its local application data. The installer never grants the Electron app root,
+never enables host forwarding, and never changes the selected egress policy.
+
+`xvfb`/VNC are installed as optional fallback display tools. Hardware mode
+still requires a usable host DRM render node and Mesa stack; the installer
+reports a clear warning when either is absent. The private OAuth browser broker
+additionally requires a locally installed Google Chrome compatible with the
+existing runtime; it is not silently downloaded or configured by this project.
+
 ## What is implemented
 
 - strict TOML profiles with synthetic hostname, MAC, CPU count, RAM, disk
@@ -26,6 +71,7 @@ invoke that helper automatically.
 - optional visible `xvfb-vnc` presentation through a per-instance Xvfb
   display and a loopback-only VNC endpoint;
 - optional private HTTP(S) URL brokering for Electron authentication flows;
+- a PySide6 desktop controller for multiple persistent Zaap instances;
 - a loopback-only network stub and a replaceable network-plan interface;
 - real-mode per-instance veth/netns policy-routing and nftables plans, with a
   fail-closed privileged executor and namespace-local DNS;
@@ -84,12 +130,19 @@ share machine IDs, boot IDs, hostnames, MACs, disk serials, or mutable home
 directories. Select a coherent platform family, or let the catalog choose
 one:
 
+The default application is the project-managed `apps/zaap.AppDir`. It is
+resolved from the project files, so commands work from any current directory;
+no `APPDIR` variable or path edit is required. The bundled AppDir must contain
+the executable `zaap`. Use `--app-root /path/to/other.AppDir` only for an
+intentional override; that directory is validated before any sandbox is
+created.
+
 ```text
 ./sandboxctl run --profile example --identity auto --hardware-class laptop \
-  --mode stub --display xvfb --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --mode stub --display xvfb --execute -- /opt/app/zaap
 
 ./sandboxctl run --profile example --identity auto --hardware-class random \
-  --mode stub --app-root "$APPDIR" -- /opt/app/zaap
+  --mode stub -- /opt/app/zaap
 ```
 
 The default remains the existing persistent TOML-profile identity for
@@ -111,14 +164,14 @@ a virtual machine.
 Inspect a launch plan without running the application:
 
 ```text
-./sandboxctl run --profile example --mode stub --app-root /path/to/extracted-AppDir -- /opt/app/zaap
+./sandboxctl run --profile example --mode stub -- /opt/app/zaap
 ```
 
 For a GUI application, request the isolated display backend explicitly:
 
 ```text
 ./sandboxctl run --profile example --mode stub --display xvfb \
-  --app-root /path/to/extracted-AppDir --execute -- /opt/app/zaap
+  --execute -- /opt/app/zaap
 ```
 
 This requires `/usr/bin/Xvfb`. The server, its staged dependencies, and the
@@ -130,7 +183,7 @@ To interact with the private display on the host desktop, use `xvfb-vnc`:
 
 ```text
 ./sandboxctl run --profile example --mode stub --display xvfb-vnc \
-  --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --execute -- /opt/app/zaap
 ```
 
 This requires `x11vnc` plus either `vncviewer` or `xtigervncviewer` to be
@@ -146,12 +199,86 @@ and no application or host root filesystem mount.
 `--display xvfb` remains the headless private-display mode for automated
 smoke tests. `--display xvfb-vnc` is the interactive mode.
 
+For performance-sensitive interactive use, an explicitly requested host
+display backend is also available:
+
+```text
+./sandboxctl run --profile example --mode stub --display host \
+  --execute -- /opt/app/zaap
+```
+
+`host` first validates the current session's local Wayland socket and exposes
+only that individual socket inside the sandbox. When `DISPLAY` identifies a
+local Xwayland server, that one X socket (and its explicitly selected
+`XAUTHORITY` cookie, if present) is also exposed and selected explicitly for
+the packaged X11-era Electron build. This avoids Ozone choosing native
+Wayland and crashing before the application window opens. If no Xwayland
+socket exists, native Wayland remains the available path. Remote/TCP displays
+and missing sockets are rejected. The host
+runtime directory, `/tmp/.X11-unix` directory, host D-Bus, credentials, and
+desktop filesystem are not mounted wholesale. Electron receives
+`ELECTRON_OZONE_PLATFORM_HINT=auto`, so whether it selects native Wayland or
+Xwayland is determined by the packaged Electron build and the available
+session.
+
+This mode is a performance optimization, not display isolation. A host
+Wayland compositor or X server is a privileged application capability: the
+application may be able to draw, receive input, obtain display metadata, or
+capture content permitted by that protocol. Use `xvfb-vnc` when the strongest
+display separation is required. All other Bubblewrap, synthetic identity,
+filesystem, process, and network restrictions remain enabled in `host` mode.
+The application command is not forced to use `--disable-gpu`; GPU flags are
+an application-level choice. Verify actual Chromium GPU behavior from the
+process command line and logs rather than assuming host display access enables
+hardware acceleration.
+
+GPU selection is explicit and opt-in: `--gpu-mode auto` (the default) adds no
+Chromium GPU flags, while `--gpu-mode software` requests the measured
+Xvfb-compatible software-rendering flags. For example:
+
+```text
+./sandboxctl run --profile example --mode stub --display xvfb \
+  --gpu-mode software --execute -- /opt/app/zaap
+```
+
+For a host-display performance run, `--gpu-mode hardware` exposes only the
+accessible DRM render node (for example `/dev/dri/renderD128`) and stages the
+matching Mesa DRI module into the private runtime:
+
+```text
+./sandboxctl run --profile example --mode stub --display host \
+  --gpu-mode hardware --execute -- /opt/app/zaap
+```
+
+Hardware mode is rejected with Xvfb because Xvfb is a software display server.
+It does not mount `/dev/dri/card*`, DRM control nodes, general `/sys`, or host
+library directories. Mesa receives the selected render node plus a generated,
+GPU-only PCI/sysfs and udev compatibility view needed for DRM identification.
+The view contains the GPU vendor/device and PCI topology needed by Mesa, but
+not live host sysfs, DMI, CPU, disk, or unrelated PCI records. Hardware mode
+also passes `--disable-software-rasterizer`, so a failed native-GL startup is
+visible instead of silently becoming SwiftShader. The
+render node is a shared physical-GPU interface, not
+a GPU security boundary: driver/GPU fingerprints, shared-resource side
+channels, and contention between instances remain possible. Keep `auto` or
+`software` when display isolation is more important than rendering speed.
+Verify acceleration from Chromium's GPU process command line and
+`chrome://gpu`; selecting the mode alone does not prove the driver accepted
+hardware rendering.
+
+The GUI uses `auto` and does not silently force `--disable-gpu`. Whether that
+mode uses hardware acceleration depends on the Electron build, display
+backend, and host drivers; inspect the GPU child command line and Chromium
+logs before comparing performance.
+
 ### External authentication URLs and first-run data
 
-With either private Xvfb display mode, `--url-broker auto` (the default)
-installs a private `xdg-open` implementation into the staged runtime. It
+With a visible sandbox display (`xvfb`, `xvfb-vnc`, or `host`),
+`--url-broker browser` installs a private `xdg-open` implementation into the
+staged runtime. `auto` enables it for private Xvfb modes; the GUI explicitly
+enables it for host-display launches. It
 accepts exactly one `http://` or `https://` URL and opens it in a private copy
-of `/opt/google/chrome`, displayed through the same Xvfb/VNC session as Zaap.
+of `/opt/google/chrome`, displayed through the selected sandbox display as Zaap.
 The browser uses its own profile beneath `/home/appsbx`; it does not see host
 cookies, keyrings, desktop services, browser profiles, or a host network
 namespace. It remains subject to `stub` offline networking or the selected
@@ -165,10 +292,25 @@ GUI launches fail closed with an actionable error. To block all external URL
 dispatch explicitly, use `--url-broker off`.
 
 The broker rejects `file:`, `data:`, JavaScript, custom schemes, relative
-paths, and option-like arguments. OAuth redirects using HTTP(S), including a
-loopback callback in the same sandbox network namespace, are supported.
+paths, and option-like arguments. Zaap 3.15.9 on Linux uses the loopback
+callback `http://127.0.0.1:9001/authorized`; because the private browser runs
+in the same sandbox network namespace, that callback reaches Zaap without a
+host port forward. Independent instances may reuse port 9001 safely.
 Custom-scheme callbacks are intentionally not brokered because forwarding
 them to the host desktop would weaken the boundary.
+
+### Downloaded game children
+
+Zaap downloads its Linux game launcher below the private profile HOME (for
+example `~/.config/Ankama/Retro/dofus1electron`). On a subsequent Zaap launch,
+`sandboxctl` reads that known executable's ELF dependency declarations and
+stages only the required system-library closure into a new immutable runtime
+bundle. The game executable and its vendor libraries remain in the profile
+home; host `/usr` and `/lib` are never mounted. A game update changes the
+child executable stamp and causes another closure to be prepared at the next
+launcher restart. If a game was downloaded during the current Zaap session,
+close and relaunch Zaap once before pressing Play so the new child closure is
+available.
 
 Zaap's first launch may log absent repository, game-release, or API-key files.
 Those are normal for an empty isolated profile. Files created by Zaap are now
@@ -186,7 +328,7 @@ in real mode a separate veth/netns/routing/firewall resource set:
 
 ```text
 ./sandboxctl run --profile example --instance-id 2 --mode real --egress wifi \
-  --force-egress --display xvfb-vnc --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --force-egress --display xvfb-vnc --execute -- /opt/app/zaap
 ```
 
 Instance IDs are `0` through `253` and must not collide with another configured
@@ -204,7 +346,7 @@ root-owned helper:
 
 ```text
 ./sandboxctl run --profile example --mode real --egress wifi \
-  --display xvfb --app-root "$APPDIR" --execute -- /opt/app/zaap
+  --display xvfb --execute -- /opt/app/zaap
 ```
 
 An egress definition in `etc/egress.d/wifi.conf` selects exactly one host
@@ -241,3 +383,81 @@ create privileged objects, or configure routing/firewall state during tests.
 Real mode is activated only after an administrator installs and authorizes the
 separate helper. The design does not claim that JavaScript API replacement is
 security isolation.
+
+## Desktop GUI
+
+The optional GUI is a non-privileged controller around the existing
+`sandboxctl` backend. Each instance has a network dropdown and a display
+dropdown: `Isolated display (Xvfb/VNC)` is the default, while `Host display
+(Wayland/X11)` is an explicit performance-oriented choice. The latter has the
+display-protocol exposure described above and has no VNC reconnect button.
+The GUI automatically manages generated hardware identity, private state,
+logs, and lifecycle. It never runs the GUI or Electron with `sudo`.
+
+The network dropdown also discovers live IPv4 interfaces automatically. An
+interface with an address and its own default route appears as an ephemeral
+entry such as `enp7s0 (detected interface)`; no configuration file is written.
+The entry is refreshed while the GUI is open and revalidated at launch. If an
+interface is unplugged or loses its route, launch fails closed rather than
+falling back to another connection.
+For automatically detected interfaces, DNS is taken from NetworkManager's
+per-interface `IP4.DNS` data when available, with that interface's gateway as
+a fallback. The host-wide resolver file is never copied, preventing DNS
+requests from being directed to another active connection.
+
+Install PySide6 for the Python interpreter used by the desktop session and
+launch from any directory:
+
+```text
+# Use the distribution's PySide6 package or a dedicated virtual environment.
+# Example for a user-owned Python environment:
+python3 -m pip install --user PySide6
+./appsbx-gui
+```
+
+For a desktop-menu entry, make the project launcher available on `PATH` (a
+symlink preserves its project-relative root resolution), then install the
+desktop file:
+
+```text
+mkdir -p ~/.local/bin ~/.local/share/applications
+ln -sfn "$(pwd)/appsbx-gui" ~/.local/bin/appsbx-gui
+cp appsbx.desktop ~/.local/share/applications/
+```
+
+The GUI uses `apps/zaap.AppDir` through the same project-relative resolver as
+the CLI. It never searches for or accepts an arbitrary executable. An
+explicit `--app-root` override is still supported by the CLI and is rejected
+if its `zaap` executable is missing or not executable.
+
+For real-mode launches, the GUI uses `pkexec` and the desktop authorization
+agent because a background Qt process has no terminal for a `sudo` password
+prompt. The authorization still applies only to the installed,
+root-owned `appsbx-net-helper`; the GUI and Electron remain unprivileged. If
+the desktop has no `pkexec` authorization agent, configure a reviewed narrow
+`NOPASSWD` sudoers rule or use the CLI from an authenticated terminal.
+
+The same command is represented by [`appsbx.desktop`](appsbx.desktop). Copy it
+to `~/.local/share/applications/` if the desktop environment does not discover
+it from the checkout. The GUI reads only valid real egress definitions from
+`etc/egress.d/`; it does not silently fall back when the selected interface is
+unavailable. Each instance gets a unique managed directory under
+`sandbox-state/gui-instances/`, a persistent generated identity, a separate
+profile ID/network namespace, and a per-instance `run.log`. GUI restarts use
+the saved controller PID to recover status and can reconnect to a still-running
+loopback-only VNC endpoint.
+
+The GUI does not expose arbitrary executable or AppDir pickers. The fixed
+command is `/opt/app/zaap --disable-gpu`; all filesystem, display, network,
+and privileged-helper restrictions remain implemented by the existing runtime.
+
+Each launch writes a sanitized profile line to stdout (and therefore to the
+GUI instance's `run.log`) before starting the application. It contains only
+synthetic hardware and selected-network values, for example:
+
+```text
+[APPSBX PROFILE] {"cpu_brand": "appsbx synthetic CPU", "cpu_vendor": "appsbx", "egress": "wifi", "hardware_class": "laptop", "interface": "wlp61s0", "logical_cpus": 4, "network_mode": "real", "profile": "example-i2", "ram_mb": 8192}
+```
+
+Machine IDs, MAC addresses, usernames, credentials, and other host-derived
+values are intentionally excluded from this summary.
