@@ -21,6 +21,7 @@ import tempfile
 from typing import Iterable
 
 from .gpu import GpuInfo
+from .syscall_guard import SyscallGuardError, build_guard
 
 
 class ELFError(ValueError):
@@ -39,7 +40,7 @@ DT_STRSZ = 10
 DT_RPATH = 15
 DT_RUNPATH = 29
 # Bump whenever the staged runtime contract changes.
-BUNDLE_VERSION = 41
+BUNDLE_VERSION = 42
 VNC_BUNDLE_VERSION = 1
 GOOGLE_CHROME_ROOT = Path("/opt/google/chrome")
 GOOGLE_CHROME_EXECUTABLE = GOOGLE_CHROME_ROOT / "chrome"
@@ -828,6 +829,14 @@ def prepare_runtime_bundle(
         queue.append(game_entry[0])
     helpers: list[Path] = []
     try:
+        # This small library installs a seccomp user-notification filter only
+        # after bwrap has finished its own setup and execs the application.
+        # It therefore cannot affect bwrap, while every payload child inherits
+        # the direct-syscall guard.
+        try:
+            build_guard(temporary)
+        except SyscallGuardError as exc:
+            raise ELFError(str(exc)) from exc
         # Electron's Linux protocol-registration path launches xdg-settings
         # before the application reaches its own setup.  Stage /bin/sh for the
         # private compatibility helper below; it is still resolved and staged

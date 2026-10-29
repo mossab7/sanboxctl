@@ -11,4 +11,5 @@ test-logs/
 *.ndjson
 *.launcher.log
 sandbox-strace.*
+native-analysis-output/
 apps/zaap.AppDir/

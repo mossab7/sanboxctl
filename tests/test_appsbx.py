@@ -62,6 +62,7 @@ from appsbx.profile import Profile, ProfileError, load_profile
 from appsbx.probe import category_report, current_observations, host_denylist, leak_categories
 from appsbx.rootfs import inspect_appimage, extraction_command
 from appsbx.runtime import LaunchPlan, _authorization_prefix, _execution_command, build_vnc_bridge_command, execute, prepare_plan
+from appsbx.syscall_guard import GUARD_NAME
 from appsbx.state import StateError, record_egress, require_egress_consistency
 
 
