@@ -250,8 +250,12 @@ class ApplicationStore:
         copy auxiliary files (including migration/account metadata) merely
         because they happen to live beside the installed game.
         """
-        source = (home / GAME_RELATIVE).resolve(strict=True)
-        if not source.is_dir() or source.is_symlink() or not _inside(source, home.resolve()):
+        try:
+            source = (home / GAME_RELATIVE).resolve(strict=True)
+            home_root = home.resolve(strict=True)
+        except OSError as exc:
+            raise ProfileError("official game directory is unavailable") from exc
+        if not source.is_dir() or source.is_symlink() or not _inside(source, home_root):
             raise ProfileError("official game directory is unavailable")
         manifest = source / "manifest.json"
         try:

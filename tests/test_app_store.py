@@ -51,6 +51,13 @@ class ApplicationStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ProfileError, "unsafe entry"):
                 ApplicationStore(Path(directory) / "state").import_retro(home)
 
+    def test_missing_first_run_game_directory_is_a_recoverable_absence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "private-home"
+            home.mkdir()
+            with self.assertRaisesRegex(ProfileError, "game directory is unavailable"):
+                ApplicationStore(Path(directory) / "state").import_retro(home)
+
     def test_staged_appdir_is_managed_and_source_is_not_used(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
