@@ -174,11 +174,15 @@ def package_command(manager: str, packages: Iterable[str]) -> list[str]:
 
 
 def default_data_dir() -> Path:
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "appsbx"
+    # Desktop launchers are often invoked from environments that set XDG_DATA_HOME
+    # to /tmp (for example, terminal sandboxes). An implicit installation must
+    # survive that environment and a reboot. Users who need another location
+    # can still pass --prefix explicitly.
+    return Path.home() / ".local" / "share" / "appsbx"
 
 
 def default_state_dir() -> Path:
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "appsbx"
+    return Path.home() / ".local" / "state" / "appsbx"
 
 
 def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
@@ -235,14 +239,21 @@ def create_venv(root: Path, *, dry_run: bool = False) -> list[list[str]]:
     return commands
 
 
-def launcher_paths() -> tuple[Path, Path]:
-    local_bin = Path(os.environ.get("XDG_BIN_HOME", Path.home() / ".local" / "bin"))
-    desktop_dir = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "applications"
+def launcher_paths(*, local_bin: Path | None = None, data_home: Path | None = None) -> tuple[Path, Path]:
+    """Return durable default launcher locations.
+
+    Explicit arguments exist for packaging/tests; environment variables are
+    deliberately not implicit installer destinations because they may point to
+    an ephemeral session directory.
+    """
+    local_bin = local_bin or (Path.home() / ".local" / "bin")
+    desktop_dir = (data_home or (Path.home() / ".local" / "share")) / "applications"
     return local_bin / "appsbx-gui", desktop_dir / "appsbx.desktop"
 
 
-def write_launchers(root: Path, state_dir: Path, *, dry_run: bool = False) -> list[Path]:
-    launcher, desktop = launcher_paths()
+def write_launchers(root: Path, state_dir: Path, *, dry_run: bool = False,
+                    local_bin: Path | None = None, data_home: Path | None = None) -> list[Path]:
+    launcher, desktop = launcher_paths(local_bin=local_bin, data_home=data_home)
     body = f"#!/usr/bin/env bash\n{LAUNCHER_MARKER}set -euo pipefail\nexport APPSBX_STATE_ROOT={state_dir!s}\nexport PYTHONPATH={root!s}${{PYTHONPATH:+:$PYTHONPATH}}\nexec {root / '.venv/bin/python'!s} -m appsbx.gui \"$@\"\n"
     entry = LAUNCHER_MARKER + "[Desktop Entry]\nType=Application\nName=appsbx Zaap Instances\nComment=Manage isolated Zaap instances\nExec=" + str(launcher) + "\nTryExec=" + str(launcher) + "\nTerminal=false\nCategories=Game;Utility;\n"
     if not dry_run:

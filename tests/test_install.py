@@ -77,11 +77,10 @@ class InstallTests(unittest.TestCase):
     def test_launcher_uses_explicit_state_root(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            with mock.patch.dict(os.environ, {
-                "XDG_BIN_HOME": str(base / "bin"),
-                "XDG_DATA_HOME": str(base / "data"),
-            }, clear=False):
-                launchers = install.write_launchers(base / "app", base / "state", dry_run=False)
+            launchers = install.write_launchers(
+                base / "app", base / "state", dry_run=False,
+                local_bin=base / "bin", data_home=base / "data",
+            )
             self.assertIn("APPSBX_STATE_ROOT=" + str(base / "state"), launchers[0].read_text(encoding="utf-8"))
             self.assertIn(install.LAUNCHER_MARKER, launchers[0].read_text(encoding="utf-8"))
             self.assertTrue(launchers[1].is_file())
