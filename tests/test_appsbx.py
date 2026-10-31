@@ -45,6 +45,7 @@ from appsbx.elf import (
     prepare_runtime_bundle,
     prepare_vnc_bundle,
     synthetic_df_script,
+    zaap_start_script,
     _validate_url_broker_display,
     _downloaded_game_entrypoint,
 )
@@ -852,6 +853,24 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(os.access(helper, os.X_OK))
             self.assertIn("appsbxfs 52428800 0 52428800 0% /home/appsbx", helper.read_text())
 
+    def test_runtime_bundle_contains_fixed_zaap_first_install_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            os.chmod(app_root / "zaap", 0o755)
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state)
+            helper = bundle.root / "usr" / "bin" / "zaap-start"
+            self.assertTrue(helper.is_file())
+            self.assertTrue(os.access(helper, os.X_OK))
+            body = helper.read_text(encoding="utf-8")
+            self.assertEqual(body, zaap_start_script())
+            self.assertIn('exec "$game" "$@"', body)
+            self.assertIn('/home/appsbx/.config/Ankama/Retro', body)
+            self.assertNotIn('eval ', body)
+            self.assertNotIn('/bin/sh -c', body)
+
     def test_runtime_bundle_contains_private_null_alsa_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -899,6 +918,37 @@ class RuntimeTests(unittest.TestCase):
             assert discovered is not None
             self.assertEqual(discovered[0], game.resolve())
             self.assertRegex(discovered[1], r"^[0-9a-f]+-[0-9a-f]+$")
+
+    def test_downloaded_game_entrypoint_accepts_the_validated_shared_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            shared = Path(directory) / "application-store" / "games" / "retro-test"
+            shared.mkdir(parents=True)
+            game = shared / "dofus1electron"
+            shutil.copy2("/bin/true", game)
+            os.chmod(game, 0o755)
+            discovered = _downloaded_game_entrypoint(state, shared)
+            self.assertIsNotNone(discovered)
+            assert discovered is not None
+            self.assertEqual(discovered[0], game.resolve())
+            self.assertRegex(discovered[1], r"^[0-9a-f]+-[0-9a-f]+$")
+
+    def test_runtime_bundle_stages_only_the_observed_game_shell_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            os.chmod(app_root / "zaap", 0o755)
+            shared = Path(directory) / "application-store" / "games" / "retro-test"
+            shared.mkdir(parents=True)
+            game = shared / "dofus1electron"
+            shutil.copy2("/bin/true", game)
+            os.chmod(game, 0o755)
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state,
+                                            shared_game_root=shared)
+            self.assertTrue((bundle.root / "usr/bin/grep").is_file())
+            self.assertFalse((bundle.root / "usr/bin/sed").exists())
 
     def test_synthetic_df_rejects_invalid_capacity(self):
         with self.assertRaises(ELFError):
