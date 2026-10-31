@@ -151,6 +151,7 @@ def prepare_plan(
     gpu_mode: str = "auto",
     gpu_info: GpuInfo | None = None,
     trace_payload: bool = False,
+    shared_game_root: Path | None = None,
 ) -> LaunchPlan:
     if network_mode not in {"stub", "real"}:
         raise ValueError("network_mode must be stub or real")
@@ -321,6 +322,24 @@ def prepare_plan(
         "--setenv", "XLOCALEDIR", "/usr/share/X11/locale",
         "--chdir", "/home/appsbx", "--",
     ])
+    if shared_game_root is not None:
+        try:
+            shared_game_root = shared_game_root.resolve(strict=True)
+            if (shared_game_root.is_symlink() or not shared_game_root.is_dir()
+                    or shared_game_root.stat().st_mode & 0o022
+                    or not (shared_game_root / "manifest.json").is_file()
+                    or not (shared_game_root / "dofus1electron").is_file()):
+                raise ValueError
+        except (OSError, ValueError) as exc:
+            raise ValueError("shared game payload is invalid") from exc
+        # The nested mount hides only this realm's empty/private game path.
+        # Its parent remains in the private home, so account data and launcher
+        # settings cannot cross between realms.
+        game_parent = profile_home / ".config" / "Ankama"
+        game_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(game_parent, 0o700)
+        separator = argv.index("--")
+        argv[separator:separator] = ["--ro-bind", str(shared_game_root), "/home/appsbx/.config/Ankama/Retro"]
     if display_backend == "xvfb":
         # The helper and X server run inside this same mount/PID/network
         # boundary.  No host DISPLAY, Wayland socket, or Xauthority is used.

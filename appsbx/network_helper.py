@@ -218,6 +218,20 @@ def _check_bwrap_command(command: list[str]) -> None:
                     raise NetworkError("privileged helper rejects writable mounts outside approved private paths")
             except IndexError as exc:
                 raise NetworkError("Bubblewrap writable mount is malformed") from exc
+        if item == "--ro-bind":
+            try:
+                source, destination = command[index + 1], command[index + 2]
+                if destination == "/home/appsbx/.config/Ankama/Retro":
+                    source_path = Path(source).resolve(strict=True)
+                    root = source_path.parents[1]
+                    marker = root / ".appsbx-game-store"
+                    if (source_path.parent.name != "games" or root.name != "application-store"
+                            or not (source_path / "manifest.json").is_file()
+                            or source_path.is_symlink() or source_path.stat().st_mode & 0o022
+                            or marker.read_text(encoding="ascii") != "appsbx immutable game store\n"):
+                        raise NetworkError("shared game mount is not a verified managed snapshot")
+            except (IndexError, OSError, UnicodeError) as exc:
+                raise NetworkError("Bubblewrap shared-game mount is malformed") from exc
     if any(not present for present in required.values()):
         raise NetworkError("Bubblewrap command is missing required isolation options")
     try:

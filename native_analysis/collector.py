@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--level", choices=("focus", "all"), default="focus")
     parser.add_argument("--categories", help="Comma-separated event categories to retain (for example machine-id,proc-cpu,drm-device).")
     parser.add_argument("--max-events", type=int, default=4000)
+    parser.add_argument("--capture-gpu-values", action="store_true", help="Record GPU API strings locally. Off by default because hardware mode intentionally exposes real renderer identifiers.")
     parser.add_argument("--rotate-mb", type=int, default=16)
     parser.add_argument("--rotate-count", type=int, default=3)
     return parser.parse_args()
@@ -69,7 +70,7 @@ def main() -> int:
             writer.write({"kind": "frida-message", "timestamp_ms": int(time.time() * 1000), "pid": pid, "message_type": message.get("type"), "description": str(message.get("description", ""))[:400]})
     script.on("message", on_message); script.load()
     categories = [item.strip() for item in (args.categories or "").split(",") if item.strip()]
-    script.exports_sync.configure({"level": args.level, "maxEvents": args.max_events, "categories": categories})
+    script.exports_sync.configure({"level": args.level, "maxEvents": args.max_events, "categories": categories, "captureGpuValues": args.capture_gpu_values})
     if spawned: device.resume(pid)
     stop = False
     def stop_handler(_signum: int, _frame: object) -> None:

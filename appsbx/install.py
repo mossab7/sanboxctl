@@ -21,6 +21,7 @@ import sys
 from typing import Iterable
 
 from .capabilities import capability_dicts
+from .app_store import ApplicationStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -185,7 +186,8 @@ def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
     return {name for name in names if name in ignored or name.endswith((".pyc", ".log", ".txt")) and name.startswith(("gui-", "hardware", "software"))}
 
 
-def install_user_copy(source: Path, destination: Path, state_dir: Path, *, replace: bool = False) -> None:
+def install_user_copy(source: Path, destination: Path, state_dir: Path, *, replace: bool = False,
+                      allow_missing_payload: bool = False) -> None:
     if destination.exists():
         if not replace:
             raise ValueError(f"installation already exists: {destination}; use --update")
@@ -205,11 +207,12 @@ def install_user_copy(source: Path, destination: Path, state_dir: Path, *, repla
         shutil.rmtree(staging)
     shutil.copytree(source, staging, symlinks=True, ignore=_copy_ignore)
     payload = validate_payload(staging)
-    if payload.status != "ok":
+    if payload.status != "ok" and not allow_missing_payload:
         shutil.rmtree(staging)
         raise ValueError(payload.detail)
-    source_hash = _sha256(source / APP_RELATIVE / "zaap")
-    if source_hash != _sha256(staging / APP_RELATIVE / "zaap"):
+    source_executable = source / APP_RELATIVE / "zaap"
+    staged_executable = staging / APP_RELATIVE / "zaap"
+    if payload.status == "ok" and _sha256(source_executable) != _sha256(staged_executable):
         shutil.rmtree(staging)
         raise ValueError("copied Zaap payload integrity check failed")
     (staging / INSTALL_MARKER).write_text("appsbx installed application\n", encoding="ascii")
@@ -310,6 +313,9 @@ def main(argv: list[str] | None = None) -> int:
     install.add_argument("--skip-network-helper", action="store_true")
     install.add_argument("--dry-run", action="store_true")
     install.add_argument("--yes", action="store_true", help="allow requested package-manager and helper commands")
+    install.add_argument("--launcher", type=Path, help="official Zaap AppDir or AppImage to stage into managed storage")
+    install.add_argument("--no-launcher-prompt", action="store_true", help="do not offer an interactive launcher selection")
+    install.add_argument("--skip-launcher-download", action="store_true", help="defer official launcher download to the GUI")
     remove = sub.add_parser("uninstall")
     remove.add_argument("--prefix", type=Path, default=default_data_dir() / "app")
     remove.add_argument("--state-dir", type=Path, default=default_state_dir())
@@ -335,16 +341,27 @@ def main(argv: list[str] | None = None) -> int:
     needs_privilege = (not args.skip_system_packages and bool(packages)) or not args.skip_network_helper
     if needs_privilege and not args.dry_run and not args.yes:
         parser.error("privileged setup needs confirmation; review `plan` then rerun with --yes, or skip the requested setup steps")
+    launcher = args.launcher
     if not args.skip_system_packages and packages and not args.dry_run:
         subprocess.run(package_command(host.package_manager, packages), check=True)
     if not args.dry_run:
-        install_user_copy(PROJECT_ROOT, args.prefix, args.state_dir, replace=args.update)
+        # A distributable may intentionally omit Ankama's proprietary payload.
+        # The GUI can stage the user's official copy after installation.
+        install_user_copy(PROJECT_ROOT, args.prefix, args.state_dir, replace=args.update,
+                          allow_missing_payload=True)
     commands = create_venv(args.prefix, dry_run=args.dry_run)
     launchers = write_launchers(args.prefix, args.state_dir, dry_run=args.dry_run)
+    staged_launcher = None
+    if not args.dry_run:
+        application_store = ApplicationStore(args.state_dir)
+        staged_launcher = (application_store.stage_launcher(launcher)
+                           if launcher is not None
+                           else None if args.skip_launcher_download
+                           else application_store.download_and_stage_official_launcher())
     helper = []
     if not args.skip_network_helper:
         helper = install_helper(args.prefix, dry_run=args.dry_run)
-    print(json.dumps({"installed": str(args.prefix), "state": str(args.state_dir), "venv_commands": commands, "launchers": [str(item) for item in launchers], "helper_commands": helper, "dry_run": args.dry_run}, indent=2, sort_keys=True))
+    print(json.dumps({"installed": str(args.prefix), "state": str(args.state_dir), "venv_commands": commands, "launchers": [str(item) for item in launchers], "configured_launcher": str(staged_launcher) if staged_launcher else None, "helper_commands": helper, "dry_run": args.dry_run}, indent=2, sort_keys=True))
     return 0
 
 

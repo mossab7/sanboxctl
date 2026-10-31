@@ -285,14 +285,14 @@ def _entrypoint(app_root: Path, app_command: Iterable[str]) -> Path:
     return path
 
 
-def _downloaded_game_entrypoint(state_dir: Path) -> tuple[Path, str] | None:
+def _downloaded_game_entrypoint(state_dir: Path, shared_game_root: Path | None = None) -> tuple[Path, str] | None:
     """Return the known Zaap Linux child executable if it is safely present.
 
     Zaap updates this Electron child below its already-private HOME. It is not
     mounted as a new host path; it is only used to stage its declared system
     ELF closure into the private runtime bundle.
     """
-    game_root = state_dir / "home" / ".config" / "Ankama" / "Retro"
+    game_root = shared_game_root if shared_game_root is not None else state_dir / "home" / ".config" / "Ankama" / "Retro"
     entrypoint = game_root / "dofus1electron"
     try:
         root = game_root.resolve(strict=True)
@@ -761,6 +761,7 @@ def prepare_runtime_bundle(
     url_broker: bool = False,
     gpu_info: GpuInfo | None = None,
     trace_hardware: bool = False,
+    shared_game_root: Path | None = None,
 ) -> RuntimeBundle:
     """Stage the executable closure and private compatibility helpers."""
     if display_backend not in {"none", "xvfb", "host"}:
@@ -771,7 +772,7 @@ def prepare_runtime_bundle(
     df_script = synthetic_df_script(synthetic_disk_mb)
     app_root = app_root.resolve()
     entrypoint = _entrypoint(app_root, app_command)
-    game_entry = _downloaded_game_entrypoint(state_dir)
+    game_entry = _downloaded_game_entrypoint(state_dir, shared_game_root)
     payload_roots = [app_root]
     game_key = "nogame"
     if game_entry is not None:

@@ -49,6 +49,15 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((destination / install.INSTALL_MARKER).is_file())
             self.assertTrue((state / install.STATE_MARKER).is_file())
 
+    def test_copy_can_install_engine_without_a_proprietary_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source"
+            source.mkdir()
+            destination = base / "installed"
+            install.install_user_copy(source, destination, base / "state", allow_missing_payload=True)
+            self.assertTrue((destination / install.INSTALL_MARKER).is_file())
+
     def test_uninstall_refuses_unmanaged_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "unmanaged"):

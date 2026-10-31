@@ -20,6 +20,11 @@ class NativeAnalysisTests(unittest.TestCase):
         self.assertIn("redacted-string", source)
         self.assertNotIn("Interceptor.replace", source)
         self.assertNotIn("Memory.write", source)
+        self.assertIn("captureGpuValues: false", source)
+        self.assertIn("glGetString", source)
+        self.assertIn("eglQueryString", source)
+        self.assertIn("drmGetDevice2", source)
+        self.assertIn("get_nprocs", source)
 
     def test_analyzer_generates_all_required_reports_without_identifier_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -36,4 +41,3 @@ class NativeAnalysisTests(unittest.TestCase):
             report = json.loads((output / "native-host-analysis.json").read_text(encoding="utf-8"))
             self.assertEqual(report["counts_by_category"], {"machine-id": 1})
             self.assertNotIn("actual-machine-id", (output / "native-host-analysis.html").read_text(encoding="utf-8"))
-

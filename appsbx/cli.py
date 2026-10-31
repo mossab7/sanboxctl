@@ -26,6 +26,7 @@ from .probe import category_report, current_observations, host_denylist, leak_ca
 from .rootfs import inspect_appimage
 from .runtime import build_vnc_bridge_command, prepare_plan
 from .state import record_egress, require_egress_consistency
+from .app_store import ApplicationStore
 
 
 PROFILES = PROJECT_ROOT / "profiles"
@@ -224,10 +225,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         url_broker = "browser" if display_backend == "xvfb" else "off"
     if url_broker == "browser" and display_backend not in {"xvfb", "host"}:
         raise ProfileError("--url-broker browser requires --display host, xvfb, or xvfb-vnc")
+    application_store = ApplicationStore(STATE)
+    shared_game_root = None if args.private_game else application_store.game_root()
+    if shared_game_root is None and not args.private_game:
+        # The first realm still performs the official download in its own
+        # private HOME. Once it has completed and the launcher is restarted,
+        # promote only manifest-listed program files into the immutable store.
+        try:
+            shared_game_root = application_store.import_retro(identity.home_dir)
+            print("[APPSBX GAME] activated verified shared Dofus payload", flush=True)
+        except ProfileError:
+            pass
     runtime_bundle = prepare_runtime_bundle(
         app_root, command, identity.state_dir, display_backend,
         identity.hardware.disk_size_mb, url_broker == "browser",
-        gpu_info, args.trace_hardware,
+        gpu_info, args.trace_hardware, shared_game_root,
     )
     payload_command = command
     if args.trace_hardware:
@@ -258,6 +270,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             host_display=host_display,
             gpu_mode=args.gpu_mode, gpu_info=gpu_info,
             trace_payload=args.trace_hardware,
+            shared_game_root=shared_game_root,
         )
         if private_display is not None:
             bridge = build_vnc_bridge_command(
@@ -273,7 +286,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         from .runtime import execute
         with profile_lock(state_scope):
             record_egress(state_scope, plan.egress)
-            return execute(runtime, vnc_service)
+            status = execute(runtime, vnc_service)
+        # A first-run or explicitly coordinated update executes against a
+        # private game directory.  Only after Zaap exits cleanly do we inspect
+        # its manifest and atomically publish program files to the shared
+        # read-only store. Credentials and launcher state stay in this realm.
+        if status == 0 and (shared_game_root is None or args.private_game):
+            try:
+                promoted = application_store.import_retro(identity.home_dir)
+                print(f"[APPSBX GAME] activated verified shared Dofus payload: {promoted}", flush=True)
+            except ProfileError:
+                pass
+        return status
     safe_argv = [
         "<app-root>" if item == str(app_root) else
         ("<identity-state>" if str(STATE) in item else item)
@@ -382,6 +406,7 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--execute", action="store_true")
     run.add_argument("--trace-hardware", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--private-game", action="store_true", help=argparse.SUPPRESS)
     run.add_argument("--force-egress", action="store_true")
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=cmd_run)

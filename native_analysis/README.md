@@ -67,6 +67,41 @@ python3 native_analysis/analyze.py \
 
 Attach separately to the actual Dofus process after Zaap launches it. A process tree is not automatically followed because global Frida spawn gating can affect unrelated host processes.
 
+## Sandboxed GPU and CPU pass
+
+This pass remains observation-only. Start a hardware-mode sandbox instance,
+wait for its normal window, then attach independently to **each** relevant
+process (main, renderer, and `--type=gpu-process`). Do not use the outer
+`strace` wrapper: ptracing the controller breaks `sudo`'s setuid validation.
+
+```bash
+# List the application's sandboxed processes without printing their full args.
+ps -eo pid=,comm=,args= | grep '[z]aap' | sed 's/ --/\n  --/g'
+
+# Replace PID with one process at a time. This records API calls and origins,
+# but redacts GPU strings by default.
+./native_analysis/run-frida.sh --pid PID --duration 120 --level all \
+  --categories pci-or-drm-topology,drm-device,drm-sysfs,graphics-api,cpu-api \
+  --output sandbox-analysis/PID.ndjson
+
+# Use only when comparing the renderer string is necessary. The resulting
+# local file contains real GPU vendor/renderer strings; do not publish it.
+./native_analysis/run-frida.sh --pid PID --duration 120 --level all \
+  --categories graphics-api --capture-gpu-values \
+  --output sandbox-analysis/PID-gpu-values.ndjson
+```
+
+`glGetString` and `eglQueryString` establish whether a process receives a
+renderer/vendor string. `drmGet*` establishes libdrm discovery, while an open
+of `/sys/dev/char/226:128/device/{vendor,device}` plus `iris_dri.so` is Mesa
+driver initialization evidence. None of those observations proves that Zaap
+JavaScript read or transmitted the value.
+
+The observer reports `sysconf`, `get_nprocs`, and `get_nprocs_conf` counts.
+It cannot observe `navigator.hardwareConcurrency` directly; use Electron
+DevTools on a renderer only if the packaged client makes it available. CPUID
+is an instruction and is likewise outside libc/Frida API interception.
+
 The output report labels ordinary Electron/Chromium infrastructure only when its recorded origin module or process role supports that attribution. It never infers Ankama collection or transmission from a local read alone.
 
 ## Interpretation

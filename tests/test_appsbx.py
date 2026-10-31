@@ -456,6 +456,24 @@ class NetworkTests(unittest.TestCase):
                 with self.assertRaises(NetworkError):
                     network_helper._check_bwrap_command(base + ["--bind", str(home), "/home/appsbx"])
 
+    def test_privileged_helper_allows_only_verified_shared_game_mount(self):
+        from appsbx import network_helper
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "application-store"
+            games = root / "games"
+            game = games / "retro-example"
+            game.mkdir(parents=True, mode=0o700)
+            (root / ".appsbx-game-store").write_text("appsbx immutable game store\n", encoding="ascii")
+            (game / "manifest.json").write_text("{}", encoding="ascii")
+            os.chmod(game, 0o555)
+            base = [
+                "bwrap", "--die-with-parent", "--unshare-user", "--cap-drop", "ALL", "--clearenv",
+                "--uid", "1000", "--gid", "1000",
+            ]
+            network_helper._check_bwrap_command(base + ["--ro-bind", str(game), "/home/appsbx/.config/Ankama/Retro"])
+            with self.assertRaises(NetworkError):
+                network_helper._check_bwrap_command(base + ["--ro-bind", str(root), "/home/appsbx/.config/Ankama/Retro"])
+
     def test_helper_rejects_down_selected_egress(self):
         from appsbx import network_helper
         result = mock.Mock(stdout='[{"operstate":"DOWN"}]')

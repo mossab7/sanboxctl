@@ -10,6 +10,7 @@ import sys
 import time
 
 from .instances import InstanceRecord, InstanceStore, active_interface_users, discover_egresses
+from .app_store import ApplicationStore
 from .network import DEFAULT_EGRESS_DIR, load_egress_definition
 from .paths import PROJECT_ROOT, state_root
 from .profile import ProfileError, load_profiles
@@ -24,7 +25,7 @@ try:
     from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QProcess, QProcessEnvironment, QIODevice, QSize, Qt, QTimer, Signal, Slot
     from PySide6.QtGui import QColor, QPalette
     from PySide6.QtWidgets import (
-        QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame,
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
         QMainWindow, QMenu, QMessageBox, QPushButton, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
     )
@@ -138,7 +139,7 @@ if QT_AVAILABLE:
                     record.vnc_endpoint = None
                 self.store.update(record)
 
-        def launch(self, record: InstanceRecord) -> None:
+        def launch(self, record: InstanceRecord, *, private_game: bool = False) -> None:
             if record.key in self.processes:
                 return
             if record.state in {"Running", "Starting"} or (record.pid and _pid_alive(record.pid)):
@@ -160,6 +161,7 @@ if QT_AVAILABLE:
                     # authentication URLs to the host desktop.
                     "--url-broker", "browser",
                     "--gpu-mode", "hardware",
+                    *( ["--private-game"] if private_game else [] ),
                     "--execute", "--",
                     "/opt/app/zaap",
                 ]
@@ -613,10 +615,13 @@ if QT_AVAILABLE:
                 raise ProfileError(f"missing base profile: {BASE_PROFILE_NAME}")
             self.egresses = discover_egresses(DEFAULT_EGRESS_DIR)
             self.store = InstanceStore(GUI_STATE, PROFILES_DIR, profiles[BASE_PROFILE_NAME])
+            self.application_store = ApplicationStore(state_root())
             self.section = "realms"
             self.model = InstanceListModel(self.store.list(), self)
             self.controller = InstanceController(self.store, self)
+            self.private_game_updates: set[str] = set()
             self.controller.recordChanged.connect(lambda _key: self.refresh())
+            self.controller.processFinished.connect(self._private_game_finished)
             self.controller.message.connect(lambda message: QMessageBox.warning(self, "Sandbox", message))
             central = QWidget(self)
             central.setObjectName("contentSurface")
@@ -680,6 +685,18 @@ if QT_AVAILABLE:
             self.new_button.clicked.connect(self.new_instance)
             self.new_button.setEnabled(bool(self.egresses))
             header.addWidget(self.new_button)
+            self.launcher_button = QPushButton("Choose Ankama Launcher…")
+            self.launcher_button.clicked.connect(self.choose_launcher)
+            self.launcher_button.hide()
+            header.addWidget(self.launcher_button)
+            self.prepare_game_button = QPushButton("Prepare shared game")
+            self.prepare_game_button.clicked.connect(self.prepare_shared_game)
+            self.prepare_game_button.hide()
+            header.addWidget(self.prepare_game_button)
+            self.update_game_button = QPushButton("Update shared game…")
+            self.update_game_button.clicked.connect(self.update_shared_game)
+            self.update_game_button.hide()
+            header.addWidget(self.update_game_button)
             content_layout.addLayout(header)
             self.notice = QLabel("Each realm keeps its own profile and network path. Display and graphics are ready for you.")
             self.notice.setObjectName("notice")
@@ -810,6 +827,10 @@ if QT_AVAILABLE:
             self.search.setVisible(realm_view)
             self.sort.setVisible(realm_view)
             self.new_button.setVisible(realm_view)
+            settings_view = section == "settings"
+            self.launcher_button.setVisible(settings_view)
+            self.prepare_game_button.setVisible(settings_view)
+            self.update_game_button.setVisible(settings_view)
             if realm_view:
                 self.heading.setText("Your realms")
                 self.notice.setText("Each realm keeps its own identity, storage, and selected network path.")
@@ -839,11 +860,97 @@ if QT_AVAILABLE:
                 self.info_panel.setPlainText("\n".join(lines) or "No realm activity yet.")
             else:
                 self.heading.setText("Launcher settings")
-                self.notice.setText("Performance and isolation defaults are managed automatically.")
+                launcher = self.application_store.launcher_root()
+                game = self.application_store.game_root()
+                self.notice.setText("Choose the official launcher once. Shared game files are verified and read-only in every realm.")
                 self.section_title.setText("SETTINGS")
                 self.info_panel.setPlainText(
-                    "DISPLAY\nNative desktop session\n\nGRAPHICS\nHardware acceleration required\n\nPERSISTENCE\nEach realm has separate identity, storage, and login state.\n\nNETWORK\nChoose a path per realm before launching."
+                    "ANKAMA LAUNCHER PATH\n"
+                    + (str(launcher) if launcher else "Not configured — choose an extracted AppDir or official AppImage.")
+                    + "\n\nSHARED GAME\n"
+                    + (str(game) if game else "Not prepared — download Dofus once in a realm, then select Prepare shared game.")
+                    + "\n\nDISPLAY\nNative desktop session\n\nGRAPHICS\nHardware acceleration required\n\nPERSISTENCE\nEach realm has separate identity, storage, and login state.\n\nNETWORK\nChoose a path per realm before launching."
                 )
+
+        @Slot()
+        def choose_launcher(self) -> None:
+            """Stage a launcher selected through the native file chooser."""
+            directory = QFileDialog.getExistingDirectory(
+                self, "Select extracted Ankama Launcher AppDir", str(Path.home()),
+                QFileDialog.Option.ShowDirsOnly,
+            )
+            selected = Path(directory) if directory else None
+            if selected is None:
+                filename, _kind = QFileDialog.getOpenFileName(
+                    self, "Or select Ankama Launcher AppImage", str(Path.home()),
+                    "AppImage files (*.AppImage *.appimage);;All files (*)",
+                )
+                selected = Path(filename) if filename else None
+            if selected is None:
+                return
+            try:
+                staged = self.application_store.stage_launcher(selected)
+            except (OSError, ProfileError) as exc:
+                QMessageBox.critical(self, "Launcher not added", str(exc))
+                return
+            QMessageBox.information(self, "Launcher ready", f"The launcher was copied into managed storage:\n{staged}")
+            self.show_section("settings")
+
+        @Slot()
+        def prepare_shared_game(self) -> None:
+            """Publish one verified, downloaded game payload for stopped realms."""
+            records = self.store.list()
+            if any(record.state in {"Running", "Starting"} for record in records):
+                QMessageBox.warning(self, "Shared game is busy", "Stop every realm before preparing or updating shared game files.")
+                return
+            for record in records:
+                try:
+                    game = self.application_store.import_retro(self.store.identity_dir(record) / "home")
+                except ProfileError:
+                    continue
+                QMessageBox.information(self, "Shared game ready", f"Verified Dofus files are now shared read-only:\n{game}")
+                self.show_section("settings")
+                return
+            QMessageBox.warning(self, "No downloaded game found", "Download Dofus once through Zaap in a realm, close it, then choose Prepare shared game.")
+
+        @Slot()
+        def update_shared_game(self) -> None:
+            """Start one private update session, then atomically publish it."""
+            records = self.store.list()
+            if any(record.state in {"Running", "Starting"} for record in records):
+                QMessageBox.warning(self, "Shared game is busy", "Stop every realm before starting a coordinated game update.")
+                return
+            if not records:
+                QMessageBox.warning(self, "No realm available", "Create a realm first.")
+                return
+            record = records[0]
+            answer = QMessageBox.question(
+                self, "Update shared game",
+                f"Zaap will open in {record.name} with its private game directory. Download the official update there, close Zaap, and Realms will verify and publish it for every realm.",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Open,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Open:
+                return
+            self.private_game_updates.add(record.key)
+            self.controller.launch(record, private_game=True)
+
+        @Slot(str, int)
+        def _private_game_finished(self, key: str, code: int) -> None:
+            if key not in self.private_game_updates:
+                return
+            self.private_game_updates.remove(key)
+            if code != 0:
+                QMessageBox.warning(self, "Game update was not published", "The private update session did not exit cleanly.")
+                return
+            try:
+                record = self._record(key)
+                game = self.application_store.import_retro(self.store.identity_dir(record) / "home")
+            except (ProfileError, StopIteration) as exc:
+                QMessageBox.warning(self, "Game update was not published", str(exc))
+                return
+            QMessageBox.information(self, "Shared game updated", f"Verified game files are ready for every realm:\n{game}")
+            self.show_section("settings")
 
         def closeEvent(self, event) -> None:
             self.controller.shutdown()

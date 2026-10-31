@@ -18,6 +18,7 @@ import tempfile
 import uuid
 
 from .identity import Identity, ensure_generated_identity
+from .app_store import ApplicationStore
 from .identity_registry import IdentityRegistry, IdentityRegistryError, RegisteredIdentity
 from .network import (
     DEFAULT_EGRESS_DIR,
@@ -353,6 +354,10 @@ def instance_app_root(explicit: str | Path | None = None) -> Path:
         raw = os.environ.get("APPSBX_APP_ROOT") or os.environ.get("APPDIR")
     if raw:
         return _validate_app_root(Path(raw), "configured Zaap AppDir")
+
+    managed = ApplicationStore(state_root()).launcher_root()
+    if managed is not None:
+        return _validate_app_root(managed, "managed Ankama Launcher")
 
     if BUNDLED_APP_ROOT.exists():
         return _validate_app_root(BUNDLED_APP_ROOT, "bundled Zaap AppDir")
