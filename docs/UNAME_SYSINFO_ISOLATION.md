@@ -1,4 +1,4 @@
-# `uname(2)` and `sysinfo(2)` isolation
+# Native identity syscall isolation
 
 `sandboxctl` uses a UTS namespace for the hostname, but Linux does not
 namespace the remaining `uname(2)` fields or `sysinfo(2)` memory counters.
@@ -10,7 +10,8 @@ results. Filesystem replacements under `/proc` do not affect direct syscalls.
 Each runtime bundle contains a small x86-64 shared object,
 `/usr/lib/appsbx/libappsbx-syscall-guard.so`. Bubblewrap sets `LD_PRELOAD` only
 for the payload exec, never for Bubblewrap itself. Its constructor installs a
-two-rule seccomp user-notification filter for `uname` and `sysinfo`, then forks
+seccomp user-notification filter for `uname`, `sysinfo`, and
+`sched_getaffinity`, then forks
 a private broker in the same PID/user namespace. The broker writes a synthetic
 `struct utsname` or `struct sysinfo` to the caller with `process_vm_writev` and
 returns the normal syscall result. Invalid target pointers return `EFAULT`.
@@ -31,11 +32,13 @@ processes. Consequently both libc wrappers and explicit `syscall(SYS_uname)` /
 | `sysinfo.freeram` | one half of profile RAM |
 | `sysinfo.uptime`, swap, high memory | zero |
 | `sysinfo.procs` / `mem_unit` | `1` / `1` |
+| `sched_getaffinity` CPU mask | profile logical-thread count |
 
 ## Verification
 
 `tests/fixtures/syscall_guard_probe.c` exercises libc, direct-syscall, fork,
-and exec paths. `tests/test_syscall_guard.py` verifies the values. A Bubblewrap
+and exec paths. `tests/test_syscall_guard.py` verifies the values and the
+synthetic affinity mask. A Bubblewrap
 smoke test can be run with the probe staged as the app payload.
 
 ## Requirements and limitations
@@ -45,8 +48,10 @@ support plus a C compiler when creating a runtime bundle. It fails closed if
 either is unavailable. A packaged release should ship a prebuilt shared object
 for each supported ABI to remove the compiler requirement.
 
-This does not virtualize CPUID, architecture-specific timing instructions,
-DRM/OpenGL information, cgroup/scheduler observations, or arbitrary kernel
+The affinity response changes what a process observes; it does not restrict or
+expand the actual scheduler CPU set. This does not virtualize CPUID,
+architecture-specific timing instructions, DRM/OpenGL information,
+cgroup/scheduler observations beyond `sched_getaffinity`, or arbitrary kernel
 interfaces. `uname.machine` remains the real supported ABI by design; claiming
 a different architecture would make the x86-64 Electron/Dofus payload
 inconsistent.

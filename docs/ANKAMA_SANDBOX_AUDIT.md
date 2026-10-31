@@ -19,11 +19,12 @@ each managed GUI instance a separate private home, identity directory, and
 real-network namespace.
 
 It is **not** a virtual machine and does not make an instance appear to be a
-separate physical computer. The implementation replaces selected files but
-does not virtualize kernel system calls, CPU instructions, the real GPU, or
-the external network identity. In particular, native code can still obtain
-the real CPU architecture, real kernel/ABI characteristics, and potentially
-real memory/CPU data through syscalls rather than the replaced `/proc` files.
+separate physical computer. The implementation replaces selected files and
+mediates `uname(2)`, `sysinfo(2)`, and `sched_getaffinity(2)`, but does not
+virtualize CPU instructions, the real GPU, or the external network identity.
+Native code can still obtain the real CPU architecture/ISA characteristics and
+may obtain real scheduler or memory facts through interfaces other than those
+mediated calls.
 Hardware mode intentionally exposes the real GPU render node, PCI IDs, PCI
 address, driver, and OpenGL renderer. Real network mode intentionally makes
 the selected host egress's public IP visible to remote services.
@@ -164,7 +165,7 @@ second one.
 | Zaap Linux data path and settings | Private per profile at `/home/appsbx/.config/Ankama` and Electron user data | Source + static Zaap code | Strong profile separation. Zaap explicitly derives Linux game path from `os.homedir()`, which becomes `/home/appsbx`. |
 | Authentication cookies/settings/downloaded game files | Persistent inside the same profile home | Source | Intentionally stable per profile; can correlate launches of that profile. It is not shared between managed profiles. |
 | CPU model/count/RAM through replaced files | Synthetic | Source | Good for `/proc` and staged tools. |
-| CPU architecture, CPUID, scheduler and memory facts through native APIs | Potentially real | Source + Linux semantics | Not virtualized. Electron/Node `process.arch`, `process.platform`, `process.version`, `os.arch()`, `os.release()`, `os.totalmem()`, native `uname(2)`, `sysinfo(2)`, CPUID, and timing are outside the file replacement scheme. Zaap statically calls `os.arch()`. |
+| CPU architecture, CPUID, scheduler and memory facts through native APIs | Mixed | Source + Linux semantics | `uname(2)`, `sysinfo(2)`, and `sched_getaffinity(2)` are mediated. `process.arch`, `process.platform`, `process.version`, `os.arch()`, CPUID, timing, cgroup state and other scheduler/memory paths remain real or potentially real. Zaap statically calls `os.arch()`. |
 | Kernel/namespace/container markers | Available | Source | `/proc/self/status`, namespace links, mountinfo, cgroup information, user-namespace UID mapping, and most unmasked `/proc/sys` remain available. |
 | Real GPU model/vendor/PCI address/driver/renderer | Available in hardware mode | Source + runtime | Intentional for acceleration. `gui-hardware-v40.txt` and `v41` show no SwiftShader flag, open `/dev/dri/renderD128`, and mapped `iris_dri.so`. |
 | Host DMI, disks, other PCI devices, DRM card/control nodes | Restricted | Source | `/sys` is tmpfs and only generated identity paths plus selected GPU topology are mounted. No `/dev/dri/card*` is added. |

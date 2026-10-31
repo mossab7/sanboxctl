@@ -227,8 +227,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     runtime_bundle = prepare_runtime_bundle(
         app_root, command, identity.state_dir, display_backend,
         identity.hardware.disk_size_mb, url_broker == "browser",
-        gpu_info,
+        gpu_info, args.trace_hardware,
     )
+    payload_command = command
+    if args.trace_hardware:
+        if not args.execute:
+            raise ProfileError("--trace-hardware requires --execute")
+        # Do not ptrace the controller: sudo deliberately rejects a traced
+        # setuid invocation. Remove the guard only from strace itself, then
+        # restore it for the target so the observed Electron/Dofus process
+        # retains normal identity mediation.
+        payload_command = ["/usr/bin/appsbx-trace", *command]
+        print(f"[APPSBX TRACE] logs: {identity.home_dir}/hardware-trace.*", flush=True)
     private_display = None
     vnc_service = None
     try:
@@ -241,12 +251,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             private_display = create_private_display(identity.state_dir)
             validate_private_display(private_display, identity.state_dir)
         runtime = prepare_plan(
-            profile, identity, app_root, command, args.mode, runtime_bundle, display_backend,
+            profile, identity, app_root, payload_command, args.mode, runtime_bundle, display_backend,
             network_plan=plan, resolv_conf=resolv_conf,
             display_socket_dir=private_display.x11_dir if private_display else None,
             display_number=private_display.display_number if private_display else 99,
             host_display=host_display,
             gpu_mode=args.gpu_mode, gpu_info=gpu_info,
+            trace_payload=args.trace_hardware,
         )
         if private_display is not None:
             bridge = build_vnc_bridge_command(
@@ -370,6 +381,7 @@ def parser() -> argparse.ArgumentParser:
         help="Electron rendering mode; hardware exposes only one DRM render node",
     )
     run.add_argument("--execute", action="store_true")
+    run.add_argument("--trace-hardware", action="store_true", help=argparse.SUPPRESS)
     run.add_argument("--force-egress", action="store_true")
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=cmd_run)

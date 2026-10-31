@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ import uuid
 from .hardware import (
     HardwareProfile,
     generate_hardware,
+    validate_hardware,
 )
 from .profile import Profile, ProfileError
 
@@ -147,6 +148,21 @@ def _new_identity(profile: Profile, state_dir: Path, hardware: HardwareProfile |
     )
 
 
+def _identity_json(identity: Identity, profile: Profile, mode: str) -> str:
+    return json.dumps({
+        "version": 2,
+        "identity_mode": mode,
+        "profile_name": identity.profile_name,
+        "profile_id": profile.profile_id,
+        "machine_id": identity.machine_id,
+        "boot_id": identity.boot_id,
+        "hardware_identity_uuid": identity.hardware_identity_uuid,
+        "runtime_uid": identity.runtime_uid,
+        "runtime_gid": identity.runtime_gid,
+        "hardware": identity.hardware.to_dict(),
+    }, sort_keys=True, indent=2) + "\n"
+
+
 def _identity_from_json(data: dict, profile: Profile, state_dir: Path) -> Identity:
     expected = {
         "profile_name": profile.name,
@@ -181,16 +197,76 @@ def _identity_from_json(data: dict, profile: Profile, state_dir: Path) -> Identi
                     hardware_identity_uuid=hardware_uuid, **expected)
 
 
+def _migrate_v1_identity(
+    data: dict, raw: str, profile: Profile, state_dir: Path, identity_path: Path,
+) -> Identity:
+    """Upgrade an old field-only record without touching profile application data."""
+    if data.get("version") != 1 or "hardware" in data:
+        raise ProfileError("persisted identity is not a migratable version-1 record")
+    expected = {
+        "profile_name": profile.name,
+        "runtime_uid": profile.runtime_uid,
+        "runtime_gid": profile.runtime_gid,
+    }
+    for key, value in expected.items():
+        if data.get(key) != value:
+            raise ProfileError(f"persisted identity does not match profile field: {key}")
+    machine_id = data.get("machine_id")
+    boot_id = data.get("boot_id")
+    if not isinstance(machine_id, str) or len(machine_id) != 32 or any(c not in "0123456789abcdef" for c in machine_id):
+        raise ProfileError("legacy machine-id is invalid")
+    try:
+        uuid.UUID(boot_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ProfileError("legacy boot_id is invalid") from exc
+
+    hardware = generate_hardware("random")
+    hostname = data.get("hostname")
+    mac = data.get("mac")
+    if isinstance(hostname, str) and hostname and len(hostname) <= 63:
+        hardware = replace(hardware, hostname=hostname.lower())
+    if isinstance(mac, str):
+        hardware = replace(hardware, mac=mac.lower())
+    try:
+        validate_hardware(hardware)
+    except ValueError as exc:
+        raise ProfileError("legacy identity contains an unsafe hostname or MAC") from exc
+    identity = Identity(
+        profile_name=profile.name, machine_id=machine_id, boot_id=boot_id,
+        hardware=hardware, runtime_uid=profile.runtime_uid,
+        runtime_gid=profile.runtime_gid, state_dir=state_dir,
+        hardware_identity_uuid=str(uuid.UUID(bytes=secrets.token_bytes(16))),
+    )
+    backup = identity_path.with_name("identity.v1.json.bak")
+    if backup.exists():
+        try:
+            if backup.read_text(encoding="utf-8") != raw:
+                raise ProfileError("legacy identity backup already exists and differs")
+        except OSError as exc:
+            raise ProfileError("legacy identity backup is unavailable") from exc
+    else:
+        _atomic_text(backup, raw)
+    _atomic_text(identity_path, _identity_json(identity, profile, "persistent"))
+    return identity
+
+
 def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
     cpu_lines = []
     for index in range(identity.cpu_count):
+        # Keep Linux's topology fields coherent with the persisted platform:
+        # one package, physical cores repeated for SMT threads.  This is a
+        # synthetic file view only; the actual scheduler topology remains a
+        # kernel property and is documented separately.
+        core_index = index % identity.hardware.physical_cores
         cpu_lines.extend([
             f"processor\t: {index}\n", f"vendor_id\t: {identity.hardware.cpu_vendor}\n",
             f"cpu family\t: {identity.hardware.cpu_family}\n", f"model\t\t: {identity.hardware.cpu_model_id}\n",
             f"model name\t: {identity.hardware.cpu_model}\n", f"stepping\t: {identity.hardware.cpu_stepping}\n",
             f"cpu MHz\t\t: {identity.hardware.cpu_mhz:.3f}\n", f"cache size\t: {identity.hardware.cache_kb} KB\n",
-            f"physical id\t: 0\n", f"core id\t\t: {index}\n",
-            f"cpu cores\t: {identity.cpu_count}\n", "flags\t\t: appsbx\n", "\n",
+            f"physical id\t: 0\n", f"siblings\t: {identity.cpu_count}\n",
+            f"core id\t\t: {core_index}\n",
+            f"cpu cores\t: {identity.hardware.physical_cores}\n",
+            "flags\t\t: appsbx\n", "\n",
         ])
     mem_kib = identity.ram_mb * 1024
     proc_stat = "cpu  " + " ".join([str(identity.cpu_count * 100)] + ["0"] * 9) + "\n"
@@ -245,9 +321,10 @@ def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
         "disk-size-sectors": str(identity.hardware.disk_size_mb * 2048) + "\n",
     }
     for index in range(identity.cpu_count):
-        files[f"cpu{index}-tsc-freq-khz"] = "1000000\n"
-        files[f"cpu{index}-scaling-cur-freq"] = "1000000\n"
-        files[f"cpu{index}-scaling-max-freq"] = "1000000\n"
+        frequency_khz = identity.hardware.cpu_mhz * 1000
+        files[f"cpu{index}-tsc-freq-khz"] = f"{frequency_khz}\n"
+        files[f"cpu{index}-scaling-cur-freq"] = f"{frequency_khz}\n"
+        files[f"cpu{index}-scaling-max-freq"] = f"{frequency_khz}\n"
     return files
 
 
@@ -309,24 +386,17 @@ def ensure_identity(profile: Profile, state_root: Path) -> Identity:
     identity_path = state_dir / "identity.json"
     if identity_path.exists():
         try:
-            data = json.loads(identity_path.read_text(encoding="utf-8"))
+            raw_identity = identity_path.read_text(encoding="utf-8")
+            data = json.loads(raw_identity)
         except (OSError, ValueError) as exc:
             raise ProfileError(f"invalid persisted identity for {profile.name}") from exc
-        identity = _identity_from_json(data, profile, state_dir)
+        if data.get("version") == 1 and "hardware" not in data:
+            identity = _migrate_v1_identity(data, raw_identity, profile, state_dir, identity_path)
+        else:
+            identity = _identity_from_json(data, profile, state_dir)
     else:
         identity = _new_identity(profile, state_dir)
-        _atomic_text(identity_path, json.dumps({
-            "version": 2,
-            "identity_mode": "persistent",
-            "profile_name": identity.profile_name,
-            "profile_id": profile.profile_id,
-            "machine_id": identity.machine_id,
-            "boot_id": identity.boot_id,
-            "hardware_identity_uuid": identity.hardware_identity_uuid,
-            "runtime_uid": identity.runtime_uid,
-            "runtime_gid": identity.runtime_gid,
-            "hardware": identity.hardware.to_dict(),
-        }, sort_keys=True, indent=2) + "\n")
+        _atomic_text(identity_path, _identity_json(identity, profile, "persistent"))
     files_dir = identity.files_dir
     files_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     rendered = _render_files(identity, profile)

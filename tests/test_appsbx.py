@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import shutil
 import stat
@@ -129,6 +130,11 @@ class IdentityTests(unittest.TestCase):
             self.assertTrue(item.socket)
             self.assertTrue(item.chipset)
 
+    def test_catalog_rejects_a_cpu_topology_from_another_platform(self):
+        hardware = generate_hardware("desktop")
+        with self.assertRaisesRegex(ValueError, "compatible catalog configuration"):
+            validate_hardware(replace(hardware, logical_cpus=hardware.logical_cpus + 1))
+
     def test_generated_identity_matches_its_linux_controlled_surfaces(self):
         profile = load_profile(EXAMPLE)
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +149,13 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(files["/sys/class/dmi/id/product_uuid"].read_text().strip(), identity.hardware_identity_uuid)
             self.assertEqual(files["/sys/block/vda/device/serial"].read_text().strip(), identity.hardware.disk_serial)
             self.assertEqual(files["/sys/block/vda/size"].read_text().strip(), str(identity.hardware.disk_size_mb * 2048))
+            cpuinfo = files["/proc/cpuinfo"].read_text()
+            self.assertEqual(cpuinfo.count("processor\t:"), identity.hardware.logical_cpus)
+            self.assertEqual(cpuinfo.count(f"cpu cores\t: {identity.hardware.physical_cores}"), identity.hardware.logical_cpus)
+            self.assertEqual(
+                files["/sys/devices/system/cpu/cpu0/tsc_freq_khz"].read_text().strip(),
+                str(identity.hardware.cpu_mhz * 1000),
+            )
 
     def test_automatic_identity_uses_private_unique_state(self):
         profile = load_profile(EXAMPLE)
@@ -184,10 +197,38 @@ class IdentityTests(unittest.TestCase):
             self.assertIn(f"cpu{first.cpu_count - 1} ", proc_stat)
             self.assertEqual(
                 first.file_paths()["/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"].read_text().strip(),
-                "1000000",
+                str(first.hardware.cpu_mhz * 1000),
             )
+            cpuinfo = first.file_paths()["/proc/cpuinfo"].read_text()
+            self.assertIn(f"siblings\t: {first.hardware.logical_cpus}", cpuinfo)
+            self.assertIn(f"cpu cores\t: {first.hardware.physical_cores}", cpuinfo)
             self.assertIn("/sys/class/dmi/id/product_name", first.file_paths())
             self.assertIn(first.hardware.platform, first.file_paths()["/sys/class/dmi/id/product_name"].read_text())
+
+    def test_version_one_identity_is_backed_up_and_migrated_without_losing_stable_ids(self):
+        profile = load_profile(EXAMPLE)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / profile.name
+            state.mkdir(parents=True)
+            original = {
+                "version": 1, "profile_name": profile.name, "profile_id": profile.profile_id,
+                "machine_id": "0123456789abcdef0123456789abcdef",
+                "boot_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "hostname": "old-private-host", "mac": "02:11:22:33:44:55",
+                "runtime_uid": profile.runtime_uid, "runtime_gid": profile.runtime_gid,
+                "cpu_count": 2, "ram_mb": 2048,
+            }
+            raw = json.dumps(original, sort_keys=True, indent=2) + "\n"
+            (state / "identity.json").write_text(raw, encoding="utf-8")
+            identity = ensure_identity(profile, Path(directory))
+            self.assertEqual(identity.machine_id, original["machine_id"])
+            self.assertEqual(identity.boot_id, original["boot_id"])
+            self.assertEqual(identity.hostname, original["hostname"])
+            self.assertEqual(identity.mac, original["mac"])
+            self.assertEqual((state / "identity.v1.json.bak").read_text(encoding="utf-8"), raw)
+            migrated = json.loads((state / "identity.json").read_text(encoding="utf-8"))
+            self.assertEqual(migrated["version"], 2)
+            self.assertIn("hardware", migrated)
 
     def test_dmi_serials_and_uuid_are_per_identity_and_not_host_values(self):
         profile = load_profile(EXAMPLE)
@@ -722,6 +763,10 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("FONTCONFIG_FILE", stub.argv)
             self.assertIn("ALSA_CONFIG_PATH", stub.argv)
             self.assertIn("DBUS_SESSION_BUS_ADDRESS", stub.argv)
+            self.assertIn(
+                ("--setenv", "APPSBX_CPU_COUNT", str(identity.cpu_count)),
+                zip(stub.argv, stub.argv[1:], stub.argv[2:]),
+            )
             self.assertIn(("--bind", str(identity.home_dir), "/home/appsbx"), zip(stub.argv, stub.argv[1:], stub.argv[2:]))
             self.assertTrue(any(item.startswith(str(bundle.root) + "/") for item in stub.argv))
             self.assertTrue((bundle.root / "usr").is_dir() or (bundle.root / "lib").is_dir())

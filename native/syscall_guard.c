@@ -1,6 +1,7 @@
 /*
  * appsbx syscall guard: a deliberately tiny seccomp user-notification broker.
- * It changes only uname(2) and sysinfo(2), including direct syscall users.
+ * It changes only uname(2), sysinfo(2), and sched_getaffinity(2), including
+ * direct syscall users. It does not change the scheduler's real CPU set.
  * The library is injected into the sandbox payload, never the bwrap launcher.
  */
 #define _GNU_SOURCE
@@ -32,6 +33,7 @@ struct guard_config {
   char version[65];
   char machine[65];
   unsigned long ram_bytes;
+  unsigned int cpu_count;
 };
 
 static struct guard_config config;
@@ -94,6 +96,30 @@ static void handle_sysinfo(int listener, struct seccomp_notif *request) {
     reply(listener, request, 0, 0);
 }
 
+static void handle_sched_getaffinity(int listener, struct seccomp_notif *request) {
+  const size_t size = (size_t)request->data.args[1];
+  if (size == 0 || request->data.args[2] == 0 || size < (config.cpu_count + 7u) / 8u) {
+    reply(listener, request, 0, EINVAL);
+    return;
+  }
+  unsigned char *mask = calloc(1, size);
+  if (mask == NULL) {
+    reply(listener, request, 0, ENOMEM);
+    return;
+  }
+  const unsigned int exposed = config.cpu_count < size * 8 ? config.cpu_count : (unsigned int)(size * 8);
+  for (unsigned int cpu = 0; cpu < exposed; ++cpu)
+    mask[cpu / 8] |= (unsigned char)(1u << (cpu % 8));
+  if (write_target(request->pid, request->data.args[2], mask, size) != 0)
+    reply(listener, request, 0, errno ? errno : EFAULT);
+  /* The raw Linux syscall returns the kernel mask size; libc normalizes it
+   * to zero. Returning the requested size keeps direct-syscall callers and
+   * libc's sched_getaffinity wrapper compatible. */
+  else
+    reply(listener, request, (long)size, 0);
+  free(mask);
+}
+
 static void broker(int listener, pid_t parent) {
   (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
   if (getppid() != parent) _exit(0);
@@ -109,6 +135,7 @@ static void broker(int listener, pid_t parent) {
     }
     if (request->data.nr == __NR_uname) handle_uname(listener, request);
     else if (request->data.nr == __NR_sysinfo) handle_sysinfo(listener, request);
+    else if (request->data.nr == __NR_sched_getaffinity) handle_sched_getaffinity(listener, request);
     else reply(listener, request, 0, ENOSYS);
   }
 }
@@ -125,6 +152,8 @@ static int install_guard(void) {
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_uname, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sysinfo, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_getaffinity, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
@@ -145,7 +174,8 @@ __attribute__((constructor)) static void appsbx_guard_init(void) {
   if (getenv("APPSBX_SYSCALL_GUARD_ACTIVE") != NULL) return;
   const char *hostname = getenv("APPSBX_UNAME_NODENAME");
   const char *ram = getenv("APPSBX_SYSINFO_TOTALRAM");
-  if (hostname == NULL || ram == NULL) return;
+  const char *cpu_count = getenv("APPSBX_CPU_COUNT");
+  if (hostname == NULL || ram == NULL || cpu_count == NULL) return;
   copy_field(config.hostname, sizeof(config.hostname), hostname);
   copy_field(config.release, sizeof(config.release), getenv("APPSBX_UNAME_RELEASE"));
   copy_field(config.version, sizeof(config.version), getenv("APPSBX_UNAME_VERSION"));
@@ -154,6 +184,12 @@ __attribute__((constructor)) static void appsbx_guard_init(void) {
   unsigned long long parsed = strtoull(ram, &end, 10);
   if (end == ram || *end != '\0' || parsed == 0 || parsed > ~0UL) { write(2, "appsbx syscall guard: invalid configuration\n", 43); _exit(125); }
   config.ram_bytes = (unsigned long)parsed;
+  end = NULL;
+  unsigned long parsed_cpus = strtoul(cpu_count, &end, 10);
+  if (end == cpu_count || *end != '\0' || parsed_cpus == 0 || parsed_cpus > 256) {
+    write(2, "appsbx syscall guard: invalid CPU configuration\n", 47); _exit(125);
+  }
+  config.cpu_count = (unsigned int)parsed_cpus;
   if (setenv("APPSBX_SYSCALL_GUARD_ACTIVE", "1", 1) != 0 || install_guard() != 0) {
     write(2, "appsbx syscall guard: unavailable\n", 34); _exit(125);
   }

@@ -29,11 +29,14 @@ class SyscallGuardTests(unittest.TestCase):
                 "APPSBX_UNAME_VERSION": "#1 SMP appsbx-test",
                 "APPSBX_UNAME_MACHINE": "x86_64",
                 "APPSBX_SYSINFO_TOTALRAM": str(8192 * 1024 * 1024),
+                "APPSBX_CPU_COUNT": "6",
             }
             output = subprocess.check_output([str(executable)], text=True, env=environment).strip().split("|")
             self.assertEqual(output[:4], ["appsbx-test-node", "appsbx-test-node", "appsbx-test-release", "appsbx-test-release"])
-            self.assertEqual(output[4:], [str(8192 * 1024 * 1024)] * 2)
+            self.assertEqual(output[4:6], [str(8192 * 1024 * 1024)] * 2)
+            self.assertEqual(output[6:], ["6", "6"])
 
             child_output = subprocess.check_output([str(executable), "--child"], text=True, env=environment).strip().split("|")
             self.assertEqual(child_output[:4], ["appsbx-test-node", "appsbx-test-node", "appsbx-test-release", "appsbx-test-release"])
-            self.assertEqual(child_output[4:], [str(8192 * 1024 * 1024)] * 2)
+            self.assertEqual(child_output[4:6], [str(8192 * 1024 * 1024)] * 2)
+            self.assertEqual(child_output[6:], ["6", "6"])

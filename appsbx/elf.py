@@ -40,7 +40,7 @@ DT_STRSZ = 10
 DT_RPATH = 15
 DT_RUNPATH = 29
 # Bump whenever the staged runtime contract changes.
-BUNDLE_VERSION = 42
+BUNDLE_VERSION = 44
 VNC_BUNDLE_VERSION = 1
 GOOGLE_CHROME_ROOT = Path("/opt/google/chrome")
 GOOGLE_CHROME_EXECUTABLE = GOOGLE_CHROME_ROOT / "chrome"
@@ -760,6 +760,7 @@ def prepare_runtime_bundle(
     synthetic_disk_mb: int = 102_400,
     url_broker: bool = False,
     gpu_info: GpuInfo | None = None,
+    trace_hardware: bool = False,
 ) -> RuntimeBundle:
     """Stage the executable closure and private compatibility helpers."""
     if display_backend not in {"none", "xvfb", "host"}:
@@ -785,7 +786,8 @@ def prepare_runtime_bundle(
     display_key = "xvfb" if display_executable else ("host" if display_backend == "host" else "nodisplay")
     gpu_key = f"gpu-{gpu_info.mesa_driver}" if gpu_info is not None else "gpu-none"
     broker_key = "browser" if browser_executable is not None else "nobrowser"
-    bundle_root = state_dir / f"runtime-v{BUNDLE_VERSION}-{key}-{game_key}-{display_key}-{gpu_key}-{broker_key}-disk{synthetic_disk_mb}"
+    trace_key = "trace" if trace_hardware else "notrace"
+    bundle_root = state_dir / f"runtime-v{BUNDLE_VERSION}-{key}-{game_key}-{display_key}-{gpu_key}-{broker_key}-{trace_key}-disk{synthetic_disk_mb}"
     manifest = bundle_root / "manifest.json"
     if manifest.exists():
         try:
@@ -798,12 +800,15 @@ def prepare_runtime_bundle(
                 and data.get("url_broker") == url_broker
                 and data.get("gpu_driver") == (gpu_info.mesa_driver if gpu_info else None)
                 and data.get("game_runtime") == game_key
+                and data.get("trace_hardware") == trace_hardware
             ):
                 script = bundle_root / "usr" / "bin" / "appsbx-xvfb-exec"
                 if display_backend == "xvfb" and not script.is_file():
                     raise ELFError("runtime bundle exists but its Xvfb helper is missing")
                 if not (bundle_root / "usr" / "bin" / "df").is_file():
                     raise ELFError("runtime bundle exists but its synthetic df helper is missing")
+                if trace_hardware and not (bundle_root / "usr" / "bin" / "appsbx-trace").is_file():
+                    raise ELFError("runtime bundle exists but its hardware trace helper is missing")
                 staged_browser = None
                 if browser_executable is not None:
                     staged_browser = bundle_root / browser_executable.relative_to("/")
@@ -847,6 +852,27 @@ def prepare_runtime_bundle(
             raise ELFError(f"required runtime helper is unavailable: {shell}")
         _stage_host_path(shell_source, temporary, staged, SYSTEM_EXECUTABLE_ROOTS + SYSTEM_LIBRARY_ROOTS)
         queue.append(shell_source)
+        if trace_hardware:
+            # This diagnostic tool is staged only on explicit request. It
+            # runs inside the sandbox after privileged network setup, rather
+            # than ptracing sudo/the controller from outside.
+            for helper in (Path("/usr/bin/env"), Path("/usr/bin/strace")):
+                source = _display_helper_source(helper)
+                if source is None:
+                    raise ELFError(f"hardware trace helper is unavailable: {helper}")
+                _stage_host_path(source, temporary, staged, SYSTEM_EXECUTABLE_ROOTS + SYSTEM_LIBRARY_ROOTS)
+                queue.append(source)
+            trace_script = temporary / "usr" / "bin" / "appsbx-trace"
+            trace_script.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            trace_script.write_text(
+                "#!/bin/sh\n"
+                "exec /usr/bin/strace -ff -tt -s 256 "
+                "-e trace=uname,sysinfo,sched_getaffinity,openat,openat2,readlink,readlinkat,statx,access,ioctl "
+                "-o /home/appsbx/hardware-trace "
+                "-E LD_PRELOAD=/usr/lib/appsbx/libappsbx-syscall-guard.so -- \"$@\"\n",
+                encoding="utf-8",
+            )
+            os.chmod(trace_script, 0o755)
         # Chromium/NSS loads these cryptographic modules at runtime rather
         # than declaring them in Electron's direct DT_NEEDED closure. The
         # network stack can therefore start successfully and then abort while
@@ -1067,6 +1093,7 @@ exit 111
             "url_broker": url_broker,
             "gpu_driver": gpu_info.mesa_driver if gpu_info else None,
             "game_runtime": game_key,
+            "trace_hardware": trace_hardware,
         }, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, bundle_root)
     except Exception:

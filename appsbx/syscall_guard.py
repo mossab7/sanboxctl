@@ -1,4 +1,4 @@
-"""Build and stage the direct-syscall uname/sysinfo guard for a runtime bundle."""
+"""Build and stage the direct-syscall identity guard for a runtime bundle."""
 from __future__ import annotations
 import hashlib
 import os
@@ -17,10 +17,10 @@ class SyscallGuardError(ValueError): pass
 def build_guard(destination: Path) -> Path:
     """Compile the architecture-specific, libc-only guard into ``destination``."""
     if platform.machine() != "x86_64":
-        raise SyscallGuardError("uname/sysinfo isolation currently requires x86_64 Linux")
+        raise SyscallGuardError("native identity syscall mediation currently requires x86_64 Linux")
     compiler = shutil.which(os.environ.get("CC", "cc"))
     if compiler is None:
-        raise SyscallGuardError("uname/sysinfo isolation requires a C compiler (set CC or install gcc/clang)")
+        raise SyscallGuardError("native identity syscall mediation requires a C compiler (set CC or install gcc/clang)")
     source = GUARD_SOURCE.read_bytes()
     digest = hashlib.sha256(source).hexdigest()
     output = destination / "usr" / "lib" / "appsbx" / GUARD_NAME

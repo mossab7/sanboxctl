@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <sched.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -18,10 +19,13 @@ int main(int argc, char **argv) {
   }
   struct utsname libc_uname, direct_uname;
   struct sysinfo libc_sysinfo, direct_sysinfo;
+  cpu_set_t libc_affinity, direct_affinity;
   if (uname(&libc_uname) || syscall(SYS_uname, &direct_uname) ||
-      sysinfo(&libc_sysinfo) || syscall(SYS_sysinfo, &direct_sysinfo)) return 2;
-  printf("%s|%s|%s|%s|%lu|%lu\n", libc_uname.nodename, direct_uname.nodename,
+      sysinfo(&libc_sysinfo) || syscall(SYS_sysinfo, &direct_sysinfo) ||
+      sched_getaffinity(0, sizeof(libc_affinity), &libc_affinity) ||
+      syscall(SYS_sched_getaffinity, 0, sizeof(direct_affinity), &direct_affinity) < 0) return 2;
+  printf("%s|%s|%s|%s|%lu|%lu|%d|%d\n", libc_uname.nodename, direct_uname.nodename,
          libc_uname.release, direct_uname.release, libc_sysinfo.totalram,
-         direct_sysinfo.totalram);
+         direct_sysinfo.totalram, CPU_COUNT(&libc_affinity), CPU_COUNT(&direct_affinity));
   return 0;
 }

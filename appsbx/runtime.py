@@ -150,6 +150,7 @@ def prepare_plan(
     host_display: HostDisplay | None = None,
     gpu_mode: str = "auto",
     gpu_info: GpuInfo | None = None,
+    trace_payload: bool = False,
 ) -> LaunchPlan:
     if network_mode not in {"stub", "real"}:
         raise ValueError("network_mode must be stub or real")
@@ -309,12 +310,13 @@ def prepare_plan(
         # libc and explicit SYS_uname/SYS_sysinfo calls have identical staged
         # results. bwrap itself is not preloaded; this takes effect at payload
         # exec and is inherited by Electron/Dofus child processes.
-        "--setenv", "LD_PRELOAD", f"/usr/lib/appsbx/{GUARD_NAME}",
+        *([] if trace_payload else ["--setenv", "LD_PRELOAD", f"/usr/lib/appsbx/{GUARD_NAME}"]),
         "--setenv", "APPSBX_UNAME_NODENAME", identity.hostname,
         "--setenv", "APPSBX_UNAME_RELEASE", "appsbx-synthetic",
         "--setenv", "APPSBX_UNAME_VERSION", "#1 SMP appsbx",
         "--setenv", "APPSBX_UNAME_MACHINE", "x86_64",
         "--setenv", "APPSBX_SYSINFO_TOTALRAM", str(identity.ram_mb * 1024 * 1024),
+        "--setenv", "APPSBX_CPU_COUNT", str(identity.cpu_count),
         "--setenv", "XKB_CONFIG_ROOT", "/usr/share/X11/xkb",
         "--setenv", "XLOCALEDIR", "/usr/share/X11/locale",
         "--chdir", "/home/appsbx", "--",

@@ -218,6 +218,20 @@ def validate_hardware(profile: HardwareProfile) -> None:
         raise ValueError("invalid hardware class")
     if profile.catalog_id not in {item.catalog_id for item in CATALOG}:
         raise ValueError("unknown hardware catalog entry")
+    # A persisted record may vary only in per-instance identifiers (serials,
+    # MAC and hostname). Every component that describes a physical platform
+    # must correspond to one fully expanded catalog configuration; accepting
+    # only the catalog ID would permit contradictory CPU/RAM/board records.
+    platform_fields = (
+        "catalog_id", "hardware_class", "platform", "cpu_vendor", "cpu_model",
+        "cpu_family", "cpu_model_id", "cpu_stepping", "physical_cores",
+        "logical_cpus", "cpu_mhz", "cache_kb", "socket", "chipset", "ram_mb",
+        "gpu", "motherboard", "bios_vendor", "bios_version", "bios_date",
+        "disk_model", "disk_size_mb", "network_adapter", "evidence_url",
+    )
+    if not any(all(getattr(profile, field) == getattr(item, field) for field in platform_fields)
+               for item in CATALOG):
+        raise ValueError("hardware profile does not match a compatible catalog configuration")
     if profile.physical_cores < 1 or profile.logical_cpus < profile.physical_cores:
         raise ValueError("inconsistent CPU core counts")
     if profile.ram_mb < 4096 or profile.ram_mb % 1024:

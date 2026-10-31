@@ -21,12 +21,12 @@ BASE_PROFILE_NAME = "example"
 VNC_ENDPOINT_RE = re.compile(r"appsbx VNC: (127\.0\.0\.1::\d+) \(loopback only\)")
 
 try:
-    from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QProcess, QProcessEnvironment, QIODevice, Qt, QTimer, Signal, Slot
+    from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QProcess, QProcessEnvironment, QIODevice, QSize, Qt, QTimer, Signal, Slot
     from PySide6.QtGui import QColor, QPalette
     from PySide6.QtWidgets import (
         QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame,
         QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
-        QMainWindow, QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget,
+        QMainWindow, QMenu, QMessageBox, QPushButton, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
     )
     QT_AVAILABLE = True
 except ModuleNotFoundError:
@@ -44,6 +44,38 @@ def _pid_alive(pid: int | None) -> bool:
 
 
 if QT_AVAILABLE:
+
+    def _style_combo_popup(combo: QComboBox) -> None:
+        """Style Qt's separate combo popup container as well as its list.
+
+        Desktop themes commonly paint the popup frame/viewport independently
+        from the application's main stylesheet, which otherwise leaves white
+        strips around dark list items.
+        """
+        view = combo.view()
+        container = view.window()
+        palette = view.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#142019"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#142019"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#142019"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#F1F4EE"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#F1F4EE"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#355039"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#F5F8F0"))
+        for widget in (view, view.viewport(), container):
+            widget.setPalette(palette)
+            widget.setAutoFillBackground(True)
+        container.setStyleSheet(
+            "QFrame { background: #142019; border: 1px solid #55743A; } "
+            "QListView { background: #142019; color: #F1F4EE; border: none; outline: none; } "
+            "QListView::item { min-height: 28px; padding: 4px 9px; } "
+            "QListView::item:hover, QListView::item:selected { background: #355039; color: #F5F8F0; }"
+        )
+        view.setStyleSheet(
+            "QListView { background: #142019; color: #F1F4EE; border: none; outline: none; } "
+            "QListView::item { min-height: 28px; padding: 4px 9px; } "
+            "QListView::item:hover, QListView::item:selected { background: #355039; color: #F5F8F0; }"
+        )
 
     class InstanceListModel(QAbstractListModel):
         """Small Qt model backing the visible instance list."""
@@ -492,6 +524,7 @@ if QT_AVAILABLE:
         launchClicked = Signal(str)
         stopClicked = Signal(str)
         cloneClicked = Signal(str)
+        renameClicked = Signal(str)
         deleteClicked = Signal(str)
         detailsClicked = Signal(str)
 
@@ -501,37 +534,40 @@ if QT_AVAILABLE:
             self.record = record
             self.setFrameShape(QFrame.Shape.StyledPanel)
             self.setObjectName("instanceCard")
+            self.setMinimumHeight(112)
             layout = QHBoxLayout(self)
-            layout.setContentsMargins(22, 18, 22, 18)
-            layout.setSpacing(14)
+            layout.setContentsMargins(18, 14, 16, 14)
+            layout.setSpacing(16)
             info = QVBoxLayout()
-            info.setSpacing(5)
+            info.setSpacing(4)
             title = QLabel(record.name)
             title.setObjectName("instanceName")
-            subtitle = QLabel("Private profile  •  separate identity and storage")
+            subtitle = QLabel("Private identity  ·  isolated storage")
             subtitle.setObjectName("instanceSubtitle")
-            self.status = QLabel(f"●  {record.state.upper()}")
+            state_label = {"Starting": "PREPARING", "Running": "RUNNING", "Stopped": "STOPPED", "Error": "FAILED"}.get(record.state, record.state.upper())
+            self.status = QLabel(f"●  {state_label}")
             self.status.setProperty("state", record.state.lower())
             info.addWidget(title)
             info.addWidget(subtitle)
             info.addWidget(self.status)
             layout.addLayout(info, 1)
             details = QVBoxLayout()
-            details.setSpacing(5)
+            details.setSpacing(4)
             network_title = QLabel("NETWORK")
             network_title.setObjectName("eyebrow")
             details.addWidget(network_title)
             self.network = QComboBox()
-            self.network.setMinimumWidth(220)
+            self.network.setMinimumWidth(210)
+            self.network.setMaximumWidth(280)
             for name, label in egresses:
                 self.network.addItem(label, name)
-            self._style_network_popup()
+            _style_combo_popup(self.network)
             current = self.network.findData(record.network)
             if current >= 0:
                 self.network.setCurrentIndex(current)
             self.network.currentIndexChanged.connect(lambda _index: self.networkChanged.emit(record.key, self.network.currentData()))
             details.addWidget(self.network)
-            display = QLabel("NATIVE DESKTOP  ·  HARDWARE GRAPHICS")
+            display = QLabel("Native desktop  ·  hardware graphics")
             display.setObjectName("displayBadge")
             details.addWidget(display)
             if interface_users and record.network in interface_users:
@@ -540,20 +576,24 @@ if QT_AVAILABLE:
                 details.addWidget(shared)
             layout.addLayout(details)
             actions = QVBoxLayout()
-            actions.setSpacing(7)
+            actions.setSpacing(5)
             self.launch = QPushButton("Play")
             self.launch.setObjectName("playButton")
             self.launch.clicked.connect(lambda: self.launchClicked.emit(record.key))
             self.stop = QPushButton("Stop")
             self.stop.clicked.connect(lambda: self.stopClicked.emit(record.key))
-            clone = QPushButton("Clone")
-            clone.clicked.connect(lambda: self.cloneClicked.emit(record.key))
-            inspect_button = QPushButton("Details")
-            inspect_button.clicked.connect(lambda: self.detailsClicked.emit(record.key))
-            delete = QPushButton("Delete")
-            delete.setObjectName("quietButton")
-            delete.clicked.connect(lambda: self.deleteClicked.emit(record.key))
-            for button in (self.launch, self.stop, clone, inspect_button, delete):
+            more = QPushButton("•••")
+            more.setObjectName("moreButton")
+            more.setToolTip("Realm actions")
+            menu = QMenu(more)
+            menu.addAction("Rename", lambda: self.renameClicked.emit(record.key))
+            menu.addAction("Clone", lambda: self.cloneClicked.emit(record.key))
+            menu.addAction("Details", lambda: self.detailsClicked.emit(record.key))
+            menu.addSeparator()
+            delete_action = menu.addAction("Delete realm", lambda: self.deleteClicked.emit(record.key))
+            delete_action.setObjectName("deleteAction")
+            more.setMenu(menu)
+            for button in (self.launch, self.stop, more):
                 actions.addWidget(button)
             layout.addLayout(actions)
             running = record.state in {"Running", "Starting"} or record.pid is not None
@@ -561,34 +601,6 @@ if QT_AVAILABLE:
             self.launch.setEnabled(not running)
             self.stop.setEnabled(running)
             self.setToolTip(record.error or "")
-
-        def _style_network_popup(self) -> None:
-            """Style the separate native Qt popup, not just the combo field.
-
-            Some desktop themes do not inherit an application's stylesheet
-            into QComboBox's popup container.  Give its view an explicit
-            palette as a second, theme-independent layer.
-            """
-            popup = self.network.view()
-            palette = popup.palette()
-            palette.setColor(QPalette.ColorRole.Window, QColor("#142019"))
-            palette.setColor(QPalette.ColorRole.Base, QColor("#142019"))
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#142019"))
-            palette.setColor(QPalette.ColorRole.Text, QColor("#F1F4EE"))
-            palette.setColor(QPalette.ColorRole.WindowText, QColor("#F1F4EE"))
-            palette.setColor(QPalette.ColorRole.Highlight, QColor("#355039"))
-            palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#F5F8F0"))
-            popup.setPalette(palette)
-            popup.viewport().setPalette(palette)
-            popup.setAutoFillBackground(True)
-            popup.setStyleSheet(
-                "QListView { background: #142019; color: #F1F4EE; "
-                "border: 1px solid #55743A; outline: none; } "
-                "QListView::item { min-height: 28px; padding: 4px 9px; } "
-                "QListView::item:hover, QListView::item:selected { "
-                "background: #355039; color: #F5F8F0; }"
-            )
-
 
     class MainWindow(QMainWindow):
         def __init__(self):
@@ -601,6 +613,7 @@ if QT_AVAILABLE:
                 raise ProfileError(f"missing base profile: {BASE_PROFILE_NAME}")
             self.egresses = discover_egresses(DEFAULT_EGRESS_DIR)
             self.store = InstanceStore(GUI_STATE, PROFILES_DIR, profiles[BASE_PROFILE_NAME])
+            self.section = "realms"
             self.model = InstanceListModel(self.store.list(), self)
             self.controller = InstanceController(self.store, self)
             self.controller.recordChanged.connect(lambda _key: self.refresh())
@@ -638,6 +651,17 @@ if QT_AVAILABLE:
             sidebar_layout.addWidget(sidebar_label)
             sidebar_layout.addWidget(sidebar_copy)
             side.addWidget(sidebar_card)
+            side.addSpacing(18)
+            self.navigation: dict[str, QPushButton] = {}
+            for key, label in (("realms", "◆  Realms"), ("network", "⌁  Network"),
+                               ("activity", "◌  Activity"), ("settings", "⚙  Settings")):
+                button = QPushButton(label)
+                button.setObjectName("navButton")
+                button.setCheckable(True)
+                button.clicked.connect(lambda _checked=False, section=key: self.show_section(section))
+                side.addWidget(button)
+                self.navigation[key] = button
+            self.navigation["realms"].setChecked(True)
             side.addStretch(1)
             side_note = QLabel("HOST DESKTOP\nHARDWARE GRAPHICS\n\nProfiles, storage and\nnetwork paths stay separate.")
             side_note.setObjectName("sideNote")
@@ -648,9 +672,9 @@ if QT_AVAILABLE:
             content_layout = QVBoxLayout(content)
             content_layout.setContentsMargins(34, 28, 34, 28)
             header = QHBoxLayout()
-            heading = QLabel("Choose your realm")
-            heading.setObjectName("heading")
-            header.addWidget(heading)
+            self.heading = QLabel("Your realms")
+            self.heading.setObjectName("heading")
+            header.addWidget(self.heading)
             header.addStretch(1)
             self.new_button = QPushButton("+  Create realm")
             self.new_button.clicked.connect(self.new_instance)
@@ -660,30 +684,47 @@ if QT_AVAILABLE:
             self.notice = QLabel("Each realm keeps its own profile and network path. Display and graphics are ready for you.")
             self.notice.setObjectName("notice")
             content_layout.addWidget(self.notice)
-            stats = QGridLayout()
-            stats.setSpacing(12)
-            self.running_stat = self._stat_card("ACTIVE REALMS", "0")
-            self.network_stat = self._stat_card("AVAILABLE PATHS", str(len(self.egresses)))
-            self.gpu_stat = self._stat_card("RENDERING", "Native GPU")
-            stats.addWidget(self.running_stat, 0, 0)
-            stats.addWidget(self.network_stat, 0, 1)
-            stats.addWidget(self.gpu_stat, 0, 2)
-            content_layout.addLayout(stats)
+            summary = QFrame()
+            summary.setObjectName("statusSummary")
+            summary_layout = QHBoxLayout(summary)
+            summary_layout.setContentsMargins(14, 8, 14, 8)
+            self.running_stat = QLabel("0 running")
+            self.running_stat.setObjectName("summaryPrimary")
+            self.network_stat = QLabel(f"{len(self.egresses)} network paths")
+            self.network_stat.setObjectName("summaryItem")
+            self.gpu_stat = QLabel("Native GPU ready")
+            self.gpu_stat.setObjectName("summaryItem")
+            for widget in (self.running_stat, self.network_stat, self.gpu_stat):
+                summary_layout.addWidget(widget)
+            summary_layout.addStretch(1)
+            content_layout.addWidget(summary)
             section = QHBoxLayout()
-            section_title = QLabel("YOUR REALMS")
-            section_title.setObjectName("eyebrow")
-            section.addWidget(section_title)
+            self.section_title = QLabel("YOUR REALMS")
+            self.section_title.setObjectName("eyebrow")
+            section.addWidget(self.section_title)
             section.addStretch(1)
             self.search = QLineEdit()
             self.search.setPlaceholderText("Find a realm…")
             self.search.setMaximumWidth(220)
             self.search.textChanged.connect(self.refresh)
             section.addWidget(self.search)
+            self.sort = QComboBox()
+            self.sort.setObjectName("sortCombo")
+            self.sort.addItem("Name", "name")
+            self.sort.addItem("Status", "status")
+            _style_combo_popup(self.sort)
+            self.sort.currentIndexChanged.connect(self.refresh)
+            section.addWidget(self.sort)
             content_layout.addLayout(section)
             self.list_widget = QListWidget()
             self.list_widget.setObjectName("instanceList")
             self.list_widget.setSpacing(8)
             content_layout.addWidget(self.list_widget, 1)
+            self.info_panel = QTextEdit()
+            self.info_panel.setObjectName("infoPanel")
+            self.info_panel.setReadOnly(True)
+            self.info_panel.hide()
+            content_layout.addWidget(self.info_panel, 1)
             self.setStyleSheet("""
                 QWidget { color: #F1F4EE; font-family: Inter, "Noto Sans", "DejaVu Sans"; }
                 QMainWindow, QWidget#contentSurface { background: #101713; }
@@ -694,6 +735,9 @@ if QT_AVAILABLE:
                 #tagline { color: #B6C2B3; font-size: 12px; font-weight: 400; letter-spacing: 0; line-height: 1.5; }
                 #sidebarCard { background: #1B2A20; border: 1px solid #344A37; border-radius: 12px; }
                 #sidebarCopy, #sideNote { color: #91A38F; font-size: 11px; line-height: 1.55; }
+                QPushButton#navButton { text-align: left; padding: 9px 11px; background: transparent; border-color: transparent; color: #AAB9A8; }
+                QPushButton#navButton:hover { background: #1E3023; color: #E4F6BC; border-color: #314B36; }
+                QPushButton#navButton:checked { background: #263B2A; color: #DDF6A8; border-color: #57773C; }
                 #heading { color: #F5F8F0; font-size: 32px; font-weight: 750; }
                 #notice { color: #AAB9A8; padding: 3px 0 16px; font-size: 13px; }
                 #instanceCard { background: #18241C; border: 1px solid #304433; border-radius: 16px; }
@@ -706,8 +750,10 @@ if QT_AVAILABLE:
                 QLabel[state="stopped"] { color: #718074; font-size: 11px; font-weight: 700; }
                 #displayBadge { color: #B9E77D; font-size: 10px; font-weight: 700; }
                 #sharedBadge { color: #C5A66A; font-size: 10px; }
+                #emptyState { color: #93A591; background: #142019; border: 1px dashed #39513B; border-radius: 14px; font-size: 13px; padding: 24px; }
                 QListWidget { background: transparent; border: none; outline: none; }
                 QComboBox, QLineEdit { background: #101713; border: 1px solid #39513B; border-radius: 8px; padding: 9px; color: #F1F4EE; }
+                QComboBox#sortCombo { min-width: 88px; }
                 QComboBox:hover, QLineEdit:focus { border-color: #92D543; }
                 QComboBox QAbstractItemView {
                     background: #142019;
@@ -731,9 +777,14 @@ if QT_AVAILABLE:
                 QPushButton#playButton:hover, QPushButton#newButton:hover { background: #C6EE8B; border-color: #E4F6BC; }
                 QPushButton#quietButton { color: #B6C2B3; background: transparent; border-color: transparent; }
                 QPushButton#quietButton:hover { color: #F0B0A4; background: #332522; border-color: #75483F; }
-                QFrame#statCard { background: #17241B; border: 1px solid #304433; border-radius: 14px; }
-                QLabel#statValue { color: #DDF6A8; font-size: 19px; font-weight: 750; }
-                QLabel#statLabel { color: #93A591; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+                QFrame#statusSummary { background: #17241B; border: 1px solid #304433; border-radius: 10px; }
+                QLabel#summaryPrimary { color: #DDF6A8; font-size: 13px; font-weight: 750; }
+                QLabel#summaryItem { color: #93A591; font-size: 11px; padding-left: 16px; }
+                QTextEdit#infoPanel { background: #142019; color: #D6E3D0; border: 1px solid #304433; border-radius: 12px; padding: 14px; font-family: "JetBrains Mono", monospace; font-size: 11px; }
+                QPushButton#moreButton { min-width: 45px; padding: 7px 8px; font-size: 14px; }
+                QMenu { background: #142019; color: #F1F4EE; border: 1px solid #49624A; padding: 6px; }
+                QMenu::item { padding: 7px 28px 7px 12px; border-radius: 5px; }
+                QMenu::item:selected { background: #355039; }
             """)
             self.new_button.setObjectName("newButton")
             if not self.egresses:
@@ -749,19 +800,50 @@ if QT_AVAILABLE:
             self.egress_timer.timeout.connect(self.refresh_egresses)
             self.egress_timer.start()
 
-        def _stat_card(self, label: str, value: str) -> QFrame:
-            card = QFrame()
-            card.setObjectName("statCard")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(16, 12, 16, 12)
-            value_label = QLabel(value)
-            value_label.setObjectName("statValue")
-            label_widget = QLabel(label)
-            label_widget.setObjectName("statLabel")
-            layout.addWidget(value_label)
-            layout.addWidget(label_widget)
-            card.value_label = value_label
-            return card
+        def show_section(self, section: str) -> None:
+            """Switch the sidebar section without touching backend state."""
+            self.section = section
+            for key, button in self.navigation.items():
+                button.setChecked(key == section)
+            realm_view = section == "realms"
+            self.list_widget.setVisible(realm_view)
+            self.search.setVisible(realm_view)
+            self.sort.setVisible(realm_view)
+            self.new_button.setVisible(realm_view)
+            if realm_view:
+                self.heading.setText("Your realms")
+                self.notice.setText("Each realm keeps its own identity, storage, and selected network path.")
+                self.section_title.setText("YOUR REALMS")
+                self.info_panel.hide()
+                self.refresh()
+                return
+            self.info_panel.show()
+            records = self.store.list()
+            if section == "network":
+                self.heading.setText("Network paths")
+                self.notice.setText("Each running realm is forced through its selected interface. No fallback is used.")
+                self.section_title.setText("NETWORK OVERVIEW")
+                lines = ["AVAILABLE NETWORK PATHS\n"]
+                for name, label in self.egresses:
+                    users = [record.name for record in records if record.network == name and record.state in {"Running", "Starting"}]
+                    lines.append(f"{label}\n  active realms: {', '.join(users) if users else 'none'}\n")
+                self.info_panel.setPlainText("\n".join(lines))
+            elif section == "activity":
+                self.heading.setText("Recent activity")
+                self.notice.setText("Latest controller state and per-realm runtime messages.")
+                self.section_title.setText("ACTIVITY")
+                lines = []
+                for record in records:
+                    detail = record.error or "No current error"
+                    lines.append(f"{record.name}  ·  {record.state}\n{detail}\n")
+                self.info_panel.setPlainText("\n".join(lines) or "No realm activity yet.")
+            else:
+                self.heading.setText("Launcher settings")
+                self.notice.setText("Performance and isolation defaults are managed automatically.")
+                self.section_title.setText("SETTINGS")
+                self.info_panel.setPlainText(
+                    "DISPLAY\nNative desktop session\n\nGRAPHICS\nHardware acceleration required\n\nPERSISTENCE\nEach realm has separate identity, storage, and login state.\n\nNETWORK\nChoose a path per realm before launching."
+                )
 
         def closeEvent(self, event) -> None:
             self.controller.shutdown()
@@ -772,9 +854,21 @@ if QT_AVAILABLE:
             self.list_widget.clear()
             query = self.search.text().lower().strip() if hasattr(self, "search") else ""
             active = [r for r in self.model.records if not query or query in r.name.lower() or query in r.profile_name.lower()]
+            if self.sort.currentData() == "status":
+                active.sort(key=lambda item: (item.state not in {"Running", "Starting"}, item.name.casefold()))
+            else:
+                active.sort(key=lambda item: item.name.casefold())
             running = sum(r.state in {"Running", "Starting"} or r.pid is not None for r in self.model.records)
-            self.running_stat.value_label.setText(str(running))
-            self.network_stat.value_label.setText(str(len(self.egresses)))
+            self.running_stat.setText(f"{running} running")
+            self.network_stat.setText(f"{len(self.egresses)} network paths")
+            if not active:
+                empty = QLabel("No realms here yet\n\nCreate a realm to give Zaap its own private identity, storage, and network path.")
+                empty.setObjectName("emptyState")
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                item = QListWidgetItem(self.list_widget)
+                item.setSizeHint(empty.sizeHint().expandedTo(QSize(0, 110)))
+                self.list_widget.addItem(item)
+                self.list_widget.setItemWidget(item, empty)
             for record in active:
                 shared = {r.network for r in self.model.records if r.key != record.key and r.state in {"Running", "Starting"}}
                 card = InstanceCard(record, self.egresses, shared, self.list_widget)
@@ -782,12 +876,16 @@ if QT_AVAILABLE:
                 card.launchClicked.connect(self.launch)
                 card.stopClicked.connect(self.stop)
                 card.cloneClicked.connect(self.clone)
+                card.renameClicked.connect(self.rename)
                 card.deleteClicked.connect(self.delete)
                 card.detailsClicked.connect(self.details)
                 item = QListWidgetItem(self.list_widget)
                 item.setSizeHint(card.sizeHint())
                 self.list_widget.addItem(item)
                 self.list_widget.setItemWidget(item, card)
+            if self.section != "realms":
+                # Keep secondary views accurate after lifecycle changes.
+                self.show_section(self.section)
 
         @Slot()
         def refresh_egresses(self) -> None:
@@ -898,9 +996,40 @@ if QT_AVAILABLE:
             self.refresh()
 
         @Slot(str)
+        def rename(self, key: str) -> None:
+            record = self._record(key)
+            dialog = RealmNameDialog("Rename realm", "Choose a new display name:", record.name, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            try:
+                # The persisted profile key deliberately stays stable: it is
+                # the identity/state binding, whereas this is a display label.
+                requested = " ".join(dialog.text().split())
+                if not requested:
+                    raise ProfileError("realm name cannot be empty")
+                if any(item.key != record.key and item.name.casefold() == requested.casefold() for item in self.store.list()):
+                    raise ProfileError("a realm with that name already exists")
+                record.name = requested
+                self.store.update(record)
+            except Exception as exc:
+                QMessageBox.warning(self, "Rename realm", str(exc))
+            self.refresh()
+
+        @Slot(str)
         def details(self, key: str) -> None:
             record = self._record(key)
-            LogDialog(f"{record.name} details", self.controller.log_text(record), self).exec()
+            try:
+                identity = self.store.ensure_identity(record)
+                overview = (
+                    f"REALM\n{record.name}\n\nSTATUS\n{record.state}\n\nNETWORK\n{record.network}\n\n"
+                    f"IDENTITY\n{identity.hostname}\n{identity.hardware.platform}\n"
+                    f"{identity.hardware.cpu_model} · {identity.hardware.ram_mb // 1024} GB RAM\n\n"
+                    f"STORAGE\n{identity.hardware.disk_model} · {identity.hardware.disk_size_mb // 1000} GB\n\n"
+                    f"GRAPHICS\nHardware GPU requested\n\nRUNTIME LOG\n"
+                )
+            except Exception as exc:
+                overview = f"REALM\n{record.name}\n\nDETAILS UNAVAILABLE\n{exc}\n\nRUNTIME LOG\n"
+            LogDialog(f"{record.name} details", overview + self.controller.log_text(record), self).exec()
 
         @Slot(str)
         def delete(self, key: str) -> None:
