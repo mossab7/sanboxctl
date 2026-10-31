@@ -177,6 +177,10 @@ if QT_AVAILABLE:
                 environment.insert("LANG", "C")
                 environment.insert("LC_ALL", "C")
                 environment.insert("PYTHONPATH", str(PROJECT_ROOT))
+                # The GUI record and the CLI must resolve the same managed
+                # state root. This is controller-only plumbing: Bubblewrap
+                # clears the target application's environment afterwards.
+                environment.insert("APPSBX_STATE_ROOT", str(state_root()))
                 # These variables are available only to the host-side
                 # controller/VNC viewer. runtime.execute() supplies a clean
                 # environment to the sandboxed application.
