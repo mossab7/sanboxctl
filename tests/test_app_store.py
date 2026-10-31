@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from appsbx.app_store import ApplicationStore
+from appsbx.app_store import ApplicationStore, OFFICIAL_LAUNCHER_URL
 from appsbx.profile import ProfileError
 
 
@@ -86,6 +86,7 @@ class ApplicationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "Ankama-controlled"):
             ApplicationStore._validate_official_url("https://example.invalid/launcher")
         ApplicationStore._validate_official_url("https://download.ankama.com/launcher/full/linux/x64")
+        ApplicationStore._validate_official_url(OFFICIAL_LAUNCHER_URL)
 
 
 if __name__ == "__main__":

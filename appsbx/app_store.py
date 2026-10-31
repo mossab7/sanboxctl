@@ -23,9 +23,16 @@ from .rootfs import RootfsError, extract_appimage, inspect_appimage
 STORE_MARKER = ".appsbx-game-store"
 LAUNCHER_MARKER = ".appsbx-launcher-store"
 GAME_RELATIVE = Path(".config/Ankama/Retro")
-OFFICIAL_LAUNCHER_URL = "https://download.ankama.com/launcher/full/linux/x64"
+# The old support-page endpoint now redirects to an account-gated web page.
+# This is the current Ankama-owned production artifact endpoint.
+OFFICIAL_LAUNCHER_URL = (
+    "https://launcher.cdn.ankama.com/installers/production/"
+    "Ankama%20Launcher-Setup-x86_64.AppImage"
+)
 MAX_LAUNCHER_BYTES = 2 * 1024 * 1024 * 1024
-OFFICIAL_DOWNLOAD_HOSTS = {"download.ankama.com", "ankama.com", "www.ankama.com"}
+OFFICIAL_DOWNLOAD_HOSTS = {
+    "download.ankama.com", "launcher.cdn.ankama.com", "ankama.com", "www.ankama.com",
+}
 
 
 def _sha256(path: Path) -> str:
