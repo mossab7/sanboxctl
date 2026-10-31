@@ -23,7 +23,7 @@ from appsbx.identity import (
     ensure_generated_identity,
     identity_report,
 )
-from appsbx.hardware import MAX_SYNTHETIC_DISK_MB, generate_hardware, validate_hardware
+from appsbx.hardware import CATALOG, MAX_SYNTHETIC_DISK_MB, generate_hardware, validate_hardware
 from appsbx.host_display import HostDisplay, HostDisplayError, detect_host_display
 from appsbx.gpu import detect_hardware_gpu
 from appsbx.cli import _gpu_flags, _instance_profile, _sandbox_compatibility_flags
@@ -111,34 +111,38 @@ class IdentityTests(unittest.TestCase):
         self.assertIn(first.cpu_model, first.cpu_model)
 
     def test_every_generated_hardware_class_has_a_df_compatible_disk_capacity(self):
-        for hardware_class in ("laptop", "desktop", "workstation", "random"):
+        for hardware_class in ("laptop", "desktop", "gaming-desktop", "workstation", "random"):
             for _ in range(16):
                 hardware = generate_hardware(hardware_class)
                 self.assertGreaterEqual(hardware.disk_size_mb, 128_000)
                 self.assertLessEqual(hardware.disk_size_mb, MAX_SYNTHETIC_DISK_MB)
                 synthetic_df_script(hardware.disk_size_mb)
 
-    def test_existing_oversized_auto_disk_is_migrated_before_materialization(self):
+    def test_catalog_expands_documented_families_to_compatible_configurations(self):
+        self.assertGreaterEqual(len(CATALOG), 300)
+        self.assertEqual({"laptop", "desktop", "gaming-desktop", "workstation"},
+            {item.hardware_class for item in CATALOG}
+        )
+        for item in CATALOG:
+            self.assertGreaterEqual(item.logical_cpus, item.physical_cores)
+            self.assertTrue(item.evidence_url.startswith("https://"))
+            self.assertTrue(item.socket)
+            self.assertTrue(item.chipset)
+
+    def test_generated_identity_matches_its_linux_controlled_surfaces(self):
         profile = load_profile(EXAMPLE)
         with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "instance"
-            identity = ensure_generated_identity(profile, state, "workstation")
-            identity_path = state / "identity.json"
-            raw = json.loads(identity_path.read_text(encoding="utf-8"))
-            raw["hardware"]["disk_size_mb"] = 1_920_000
-            identity_path.write_text(json.dumps(raw), encoding="utf-8")
-
-            migrated = ensure_generated_identity(profile, state, "workstation")
-
-            self.assertEqual(migrated.hardware.disk_size_mb, 960_000)
-            self.assertEqual(
-                migrated.file_paths()["/sys/block/vda/size"].read_text().strip(),
-                str(960_000 * 2048),
-            )
-            self.assertEqual(
-                json.loads(identity_path.read_text(encoding="utf-8"))["hardware"]["disk_size_mb"],
-                960_000,
-            )
+            identity = ensure_generated_identity(profile, Path(directory) / "identity")
+            files = identity.file_paths()
+            self.assertEqual(files["/etc/hostname"].read_text().strip(), identity.hardware.hostname)
+            self.assertEqual(files["/sys/class/dmi/id/product_name"].read_text().strip(), identity.hardware.platform)
+            self.assertEqual(files["/sys/class/dmi/id/board_name"].read_text().strip(), identity.hardware.motherboard)
+            self.assertEqual(files["/sys/class/dmi/id/product_serial"].read_text().strip(), identity.hardware.system_serial)
+            self.assertEqual(files["/sys/class/dmi/id/board_serial"].read_text().strip(), identity.hardware.board_serial)
+            self.assertEqual(files["/sys/class/dmi/id/chassis_serial"].read_text().strip(), identity.hardware.chassis_serial)
+            self.assertEqual(files["/sys/class/dmi/id/product_uuid"].read_text().strip(), identity.hardware_identity_uuid)
+            self.assertEqual(files["/sys/block/vda/device/serial"].read_text().strip(), identity.hardware.disk_serial)
+            self.assertEqual(files["/sys/block/vda/size"].read_text().strip(), str(identity.hardware.disk_size_mb * 2048))
 
     def test_automatic_identity_uses_private_unique_state(self):
         profile = load_profile(EXAMPLE)
@@ -170,13 +174,14 @@ class IdentityTests(unittest.TestCase):
             first = ensure_identity(profile, Path(directory))
             second = ensure_identity(profile, Path(directory))
             self.assertEqual(first.machine_id, second.machine_id)
-            self.assertEqual(first.hostname, "appsbx-example")
+            self.assertEqual(first.hostname, second.hostname)
+            self.assertNotIn("appsbx", first.hostname.lower())
             self.assertEqual(first.file_paths()["/etc/machine-id"].read_text().strip(), first.machine_id)
             self.assertEqual(first.file_paths()["/var/lib/dbus/machine-id"].read_text().strip(), first.machine_id)
             self.assertIn("model name", first.file_paths()["/proc/cpuinfo"].read_text())
             proc_stat = first.file_paths()["/proc/stat"].read_text()
             self.assertIn("cpu0 ", proc_stat)
-            self.assertIn("cpu1 ", proc_stat)
+            self.assertIn(f"cpu{first.cpu_count - 1} ", proc_stat)
             self.assertEqual(
                 first.file_paths()["/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"].read_text().strip(),
                 "1000000",
@@ -712,7 +717,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("--ro-bind", stub.argv)
             self.assertNotIn("--ro-bind-data", stub.argv)
             self.assertEqual(stub.pass_fds, ())
-            self.assertEqual(len(stub.identity_files), 49)
+            self.assertEqual(len(stub.identity_files), len(identity.file_paths()))
             self.assertIn("--setenv", stub.argv)
             self.assertIn("FONTCONFIG_FILE", stub.argv)
             self.assertIn("ALSA_CONFIG_PATH", stub.argv)
@@ -739,7 +744,7 @@ class RuntimeTests(unittest.TestCase):
             bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state)
             plan = prepare_plan(profile, identity, app_root, ["/opt/app/zaap"], "real", bundle)
             self.assertEqual(plan.pass_fds, ())
-            self.assertEqual(len(plan.identity_files), 49)
+            self.assertEqual(len(plan.identity_files), len(identity.file_paths()))
             for destination, source in plan.identity_files.items():
                 self.assertIn(("--ro-bind", str(source), destination), zip(
                     plan.argv, plan.argv[1:], plan.argv[2:]

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "evidence_note": "Each record is a documented platform family. Firmware, RAM, and storage options are compatibility matrices, not claims that every combination was shipped as a retail SKU.",
+  "templates": [
+    {
+      "id": "dell-latitude-5420", "class": "laptop", "platform": "Dell Latitude 5420",
+      "cpu_vendor": "GenuineIntel", "cpu": "11th Gen Intel(R) Core(TM) i5-1145G7", "family": 6, "model": 140, "stepping": 1, "cores": 4, "threads": 8, "mhz": 2600, "cache_kb": 8192,
+      "socket": "FCBGA1449", "chipset": "Tiger Lake-UP3", "gpu": "Intel Iris Xe Graphics", "board": "Dell 0H0YVY", "bios_vendor": "Dell Inc.", "bios": ["1.18.0", "1.20.0", "1.22.0", "1.24.0"], "date": "2023-05-12",
+      "ram": [8192, 16384, 32768, 65536], "disks": [["KIOXIA KBG40ZNS512G", 512000], ["WDC PC SN530 SDBPZK-512G", 512000], ["SAMSUNG MZVLQ1T0HBLB", 1000000], ["SK hynix PC711", 1000000]], "nic": "Intel Wi-Fi 6 AX201",
+      "source": "https://www.dell.com/support/manuals/latitude-14-5420-laptop"
+    },
+    {
+      "id": "lenovo-t14-g2", "class": "laptop", "platform": "Lenovo ThinkPad T14 Gen 2",
+      "cpu_vendor": "AuthenticAMD", "cpu": "AMD Ryzen 5 PRO 5650U with Radeon Graphics", "family": 25, "model": 80, "stepping": 0, "cores": 6, "threads": 12, "mhz": 2300, "cache_kb": 16384,
+      "socket": "FP6", "chipset": "AMD SoC", "gpu": "AMD Radeon Graphics", "board": "Lenovo 20XK", "bios_vendor": "LENOVO", "bios": ["R1BET62W", "R1BET64W", "R1MET62W", "R1MET64W"], "date": "2023-02-08",
+      "ram": [8192, 16384, 32768, 65536], "disks": [["SAMSUNG MZVLQ512HALU", 512000], ["SK hynix PC711", 512000], ["KIOXIA KBG40ZNS1T02", 1000000], ["WD PC SN740", 1000000]], "nic": "Intel Wi-Fi 6 AX200",
+      "source": "https://psref.lenovo.com/Product/ThinkPad/ThinkPad_T14_Gen_2_AMD"
+    },
+    {
+      "id": "hp-elitedesk-800-g6", "class": "desktop", "platform": "HP EliteDesk 800 G6",
+      "cpu_vendor": "GenuineIntel", "cpu": "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz", "family": 6, "model": 165, "stepping": 5, "cores": 8, "threads": 16, "mhz": 2900, "cache_kb": 16384,
+      "socket": "LGA1200", "chipset": "Intel Q470", "gpu": "Intel UHD Graphics 630", "board": "HP 8767", "bios_vendor": "HP", "bios": ["02.17.00", "02.20.00", "02.22.00", "02.24.00"], "date": "2023-11-03",
+      "ram": [16384, 32768, 65536, 128000], "disks": [["WD_BLACK SN770", 512000], ["Samsung SSD 980 PRO", 1000000], ["Crucial P5 Plus", 1000000], ["SK hynix PC711", 1000000]], "nic": "Intel Ethernet Connection I219-LM",
+      "source": "https://support.hp.com/us-en/product/details/hp-elitedesk-800-g6-desktop-mini-pc/34565028"
+    },
+    {
+      "id": "asus-z690", "class": "gaming-desktop", "platform": "Custom ASUS Z690 Gaming PC",
+      "cpu_vendor": "GenuineIntel", "cpu": "12th Gen Intel(R) Core(TM) i7-12700K", "family": 6, "model": 151, "stepping": 2, "cores": 12, "threads": 20, "mhz": 3600, "cache_kb": 25600,
+      "socket": "LGA1700", "chipset": "Intel Z690", "gpu": "NVIDIA GeForce RTX 3070", "board": "ASUS TUF GAMING Z690-PLUS WIFI D4", "bios_vendor": "American Megatrends International", "bios": ["0811", "1203", "2004", "2801"], "date": "2023-09-14",
+      "ram": [16384, 32768, 65536, 128000], "disks": [["Samsung SSD 980 PRO", 512000], ["WD_BLACK SN850X", 1000000], ["Crucial T500", 1000000], ["Samsung SSD 990 PRO", 1000000]], "nic": "Intel Wi-Fi 6 AX201",
+      "source": "https://www.asus.com/motherboards-components/motherboards/tuf-gaming/tuf-gaming-z690-plus-wifi-d4/"
+    },
+    {
+      "id": "lenovo-p620", "class": "workstation", "platform": "Lenovo ThinkStation P620",
+      "cpu_vendor": "AuthenticAMD", "cpu": "AMD Ryzen Threadripper PRO 3955WX 16-Cores", "family": 25, "model": 1, "stepping": 0, "cores": 16, "threads": 32, "mhz": 3900, "cache_kb": 65536,
+      "socket": "sWRX8", "chipset": "AMD WRX80", "gpu": "NVIDIA RTX A4000", "board": "Lenovo 1036", "bios_vendor": "LENOVO", "bios": ["S07KT1B", "S07KT2B", "S07KT3B", "S07KT4B"], "date": "2022-10-14",
+      "ram": [65536, 131072, 256000, 512000], "disks": [["Samsung PM983", 960000], ["KIOXIA CD6", 960000], ["Samsung PM9A3", 1000000], ["Micron 7450 PRO", 1000000]], "nic": "Intel Ethernet Connection I219-LM",
+      "source": "https://psref.lenovo.com/Product/ThinkStation/ThinkStation_P620"
+    }
+  ]
+}

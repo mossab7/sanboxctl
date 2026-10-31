@@ -6,8 +6,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from appsbx.cli import parser
-from appsbx.identity import identity_report
+from appsbx.cli import _named_instance_profile, parser
+from appsbx.identity import identity_report, load_identity_for_inspection
+from appsbx.identity_registry import IdentityRegistry
 from appsbx.instances import BUNDLED_APP_ROOT, InstanceStore, active_interface_users, discover_egresses, instance_app_root
 from appsbx.network import EgressDefinition, _live_interface_definition
 import ipaddress
@@ -30,7 +31,10 @@ class InstanceStoreTests(unittest.TestCase):
             identity = store.ensure_identity(first)
             again = store.ensure_identity(first)
             self.assertEqual(identity.machine_id, again.machine_id)
+            self.assertEqual(identity.hardware_identity_uuid, again.hardware_identity_uuid)
             self.assertNotEqual(identity.hardware.hardware_class, "legacy")
+            raw_identity = json.loads((store.identity_dir(first) / "identity.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw_identity["hardware_identity_uuid"], identity.hardware_identity_uuid)
             self.assertTrue(all(identity_report(identity)["consistency"].values()))
             self.assertEqual({item.key for item in store.list()}, {first.key, second.key})
 
@@ -71,6 +75,44 @@ class InstanceStoreTests(unittest.TestCase):
             store.delete(record)
             self.assertFalse(instance_dir.exists())
             self.assertEqual(store.list(), [])
+
+    def test_clone_has_independent_identity_and_private_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InstanceStore(Path(directory) / "instances", ROOT / "profiles", PROFILE)
+            original = store.create("wifi", "Mia's Realm")
+            clone = store.clone(original, "Mia's second realm")
+            first = store.ensure_identity(original)
+            second = store.ensure_identity(clone)
+            self.assertEqual(original.name, "Mia's Realm")
+            self.assertEqual(clone.name, "Mia's second realm")
+            self.assertNotIn("example", original.profile_name)
+            self.assertEqual(
+                load_identity_for_inspection(store.profile_for(original), store.identity_dir(original)).profile_name,
+                original.profile_name,
+            )
+            self.assertNotEqual(first.machine_id, second.machine_id)
+            self.assertNotEqual(first.hardware_identity_uuid, second.hardware_identity_uuid)
+            self.assertNotEqual(first.home_dir, second.home_dir)
+
+    def test_delete_retires_registry_identity_before_removing_instance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "instances"
+            store = InstanceStore(root, ROOT / "profiles", PROFILE)
+            record = store.create("wifi")
+            registry = IdentityRegistry(root / "identity-registry.sqlite3")
+            self.assertTrue(registry.is_registered(record.key))
+            store.delete(record)
+            # A retired row remains as a collision tombstone.
+            self.assertTrue(registry.is_registered(record.key))
+
+    def test_realm_name_is_unique_and_internal_profile_name_is_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = InstanceStore(Path(directory) / "instances", ROOT / "profiles", PROFILE)
+            record = store.create("wifi", "  Raven's   Grove  ")
+            self.assertEqual(record.name, "Raven's Grove")
+            self.assertEqual(record.profile_name, "raven-s-grove-i2")
+            with self.assertRaisesRegex(ProfileError, "already exists"):
+                store.create("wifi", "raven's grove")
 
     def test_egress_discovery_skips_invalid_definitions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -141,6 +183,16 @@ class InstanceStoreTests(unittest.TestCase):
         args = parser().parse_args(["run", "--profile", "example", "--", "/opt/app/zaap"])
         self.assertIsNone(args.app_root)
 
+    def test_cli_accepts_gui_internal_profile_name(self):
+        args = parser().parse_args([
+            "run", "--profile", "example", "--instance-id", "2",
+            "--profile-name", "raven-s-grove-i2", "--", "/opt/app/zaap",
+        ])
+        self.assertEqual(args.profile_name, "raven-s-grove-i2")
+        named = _named_instance_profile(PROFILE, args.instance_id, args.profile_name)
+        self.assertEqual(named.name, "raven-s-grove-i2")
+        self.assertEqual(named.profile_id, 2)
+
     @unittest.skipUnless(gui.QT_AVAILABLE, "PySide6 is not installed for this Python")
     def test_gui_renders_persisted_instances_on_startup(self):
         """Regression: initial rendering must not wait for New Instance."""
@@ -153,6 +205,31 @@ class InstanceStoreTests(unittest.TestCase):
             window = gui.MainWindow()
             try:
                 self.assertEqual(window.list_widget.count(), 1)
+            finally:
+                window.controller.shutdown()
+                window.close()
+        app.processEvents()
+
+    @unittest.skipUnless(gui.QT_AVAILABLE, "PySide6 is not installed for this Python")
+    def test_gui_clone_creates_an_independent_realm(self):
+        app = gui.QApplication.instance() or gui.QApplication([])
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(gui, "GUI_STATE", Path(directory) / "instances"), \
+             mock.patch.object(gui, "discover_egresses", return_value=[("wifi", "Wi-Fi")]), \
+             mock.patch.object(gui, "RealmNameDialog") as name_dialog:
+            name_dialog.return_value.exec.return_value = gui.QDialog.DialogCode.Accepted
+            name_dialog.return_value.text.return_value = "Copied realm"
+            window = gui.MainWindow()
+            try:
+                original = window.store.create("wifi", "Original realm")
+                window.refresh()
+                window.clone(original.key)
+                records = window.store.list()
+                self.assertEqual(len(records), 2)
+                self.assertNotEqual(
+                    window.store.ensure_identity(records[0]).hardware_identity_uuid,
+                    window.store.ensure_identity(records[1]).hardware_identity_uuid,
+                )
             finally:
                 window.controller.shutdown()
                 window.close()

@@ -145,21 +145,20 @@ created.
   --mode stub -- /opt/app/zaap
 ```
 
-The default remains the existing persistent TOML-profile identity for
-backward compatibility. `--hardware-class` is intentionally rejected unless
-`--identity auto` is selected. Automatic profiles choose a complete compatible
-platform variant first, then compatible RAM, storage, firmware, and unique
-instance identifiers; fields are not independently mixed.
+New persistent identities and `--identity auto` identities both use the
+versioned catalog. `--hardware-class` is intentionally rejected unless
+`--identity auto` is selected. The GUI always creates a persistent catalog
+identity. A platform variant is selected first, then only its compatible RAM,
+storage, firmware, and unique identity values are used; fields are never
+independently mixed. See [hardware identity details](docs/HARDWARE_IDENTITY.md).
 
 The generated profile is rendered into the existing synthetic views:
 `/proc/cpuinfo`, `/proc/meminfo`, CPU frequency files, DMI files under
 `/sys/class/dmi/id`, a synthetic `/sys/block/vda` model/serial/size, and the
 synthetic `/etc` identity files. These are filesystem replacements inside the
-Bubblewrap mount namespace. They do not spoof CPUID, GPU driver queries,
-`sysinfo(2)`, kernel ioctls, timing, or other native/kernel hardware APIs.
-Electron/Node APIs that use those lower-level mechanisms can therefore still
-observe inconsistencies; the automatic profile is a compatibility layer, not
-a virtual machine.
+Bubblewrap mount namespace. They do not spoof CPUID, physical GPU/DRM queries,
+kernel ioctls, timing, or other hardware-backed APIs. The automatic profile is
+a compatibility layer, not a virtual machine.
 
 Inspect a launch plan without running the application:
 
@@ -387,12 +386,10 @@ security isolation.
 ## Desktop GUI
 
 The optional GUI is a non-privileged controller around the existing
-`sandboxctl` backend. Each instance has a network dropdown and a display
-dropdown: `Isolated display (Xvfb/VNC)` is the default, while `Host display
-(Wayland/X11)` is an explicit performance-oriented choice. The latter has the
-display-protocol exposure described above and has no VNC reconnect button.
-The GUI automatically manages generated hardware identity, private state,
-logs, and lifecycle. It never runs the GUI or Electron with `sudo`.
+`sandboxctl` backend. It uses the host desktop and hardware-GPU backend by
+default; the network dropdown is the user-facing setting. The GUI automatically
+manages generated hardware identity, private state, logs, lifecycle, and
+settings-only cloning. It never runs the GUI or Electron with `sudo`.
 
 The network dropdown also discovers live IPv4 interfaces automatically. An
 interface with an address and its own default route appears as an ephemeral
@@ -448,7 +445,7 @@ the saved controller PID to recover status and can reconnect to a still-running
 loopback-only VNC endpoint.
 
 The GUI does not expose arbitrary executable or AppDir pickers. The fixed
-command is `/opt/app/zaap --disable-gpu`; all filesystem, display, network,
+command is `/opt/app/zaap`; all filesystem, display, network,
 and privileged-helper restrictions remain implemented by the existing runtime.
 
 Each launch writes a sanitized profile line to stdout (and therefore to the
@@ -456,7 +453,7 @@ GUI instance's `run.log`) before starting the application. It contains only
 synthetic hardware and selected-network values, for example:
 
 ```text
-[APPSBX PROFILE] {"cpu_brand": "appsbx synthetic CPU", "cpu_vendor": "appsbx", "egress": "wifi", "hardware_class": "laptop", "interface": "wlp61s0", "logical_cpus": 4, "network_mode": "real", "profile": "example-i2", "ram_mb": 8192}
+[APPSBX PROFILE] {"cpu_brand": "11th Gen Intel(R) Core(TM) i5-1145G7", "cpu_vendor": "GenuineIntel", "egress": "wifi", "hardware_class": "laptop", "interface": "wlp61s0", "logical_cpus": 8, "network_mode": "real", "profile": "example-i2", "ram_mb": 16384}
 ```
 
 Machine IDs, MAC addresses, usernames, credentials, and other host-derived

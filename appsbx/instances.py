@@ -12,11 +12,13 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import uuid
 
 from .identity import Identity, ensure_generated_identity
+from .identity_registry import IdentityRegistry, IdentityRegistryError, RegisteredIdentity
 from .network import (
     DEFAULT_EGRESS_DIR,
     EgressDefinition,
@@ -35,6 +37,25 @@ INSTANCE_ID_MIN = 2
 INSTANCE_ID_MAX = 253
 GUI_STATE = state_root() / "gui-instances"
 BUNDLED_APP_ROOT = PROJECT_ROOT / "apps" / "zaap.AppDir"
+
+
+def _realm_profile_name(name: str, profile_id: int) -> str:
+    """Derive a safe internal profile name from a user-facing realm name."""
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not slug or not slug[0].isalpha():
+        slug = f"realm-{slug}"
+    return f"{slug[:24].rstrip('-')}-i{profile_id}"
+
+
+def _validate_realm_name(name: str, records: list["InstanceRecord"]) -> str:
+    if not isinstance(name, str):
+        raise ProfileError("realm name must be text")
+    normalized = " ".join(name.split())
+    if not 1 <= len(normalized) <= 48 or any(not char.isprintable() for char in normalized):
+        raise ProfileError("realm name must contain 1–48 printable characters")
+    if normalized.casefold() in {record.name.casefold() for record in records}:
+        raise ProfileError("a realm with that name already exists")
+    return normalized
 
 
 @dataclass
@@ -160,9 +181,23 @@ class InstanceStore:
         return path
 
     def ensure_identity(self, record: InstanceRecord) -> Identity:
-        return ensure_generated_identity(self.profile_for(record), self.identity_dir(record), "random")
+        identity = ensure_generated_identity(self.profile_for(record), self.identity_dir(record), "random")
+        registry = IdentityRegistry(self.root / "identity-registry.sqlite3")
+        if not registry.is_registered(record.key):
+            try:
+                registry.register(RegisteredIdentity(
+                    record.key, identity.hardware_identity_uuid, identity.machine_id,
+                    identity.hostname, identity.mac, identity.hardware.disk_serial,
+                ))
+            except IdentityRegistryError:
+                # A concurrent caller may have registered this exact instance
+                # after our initial check.  Anything else is a collision and
+                # must fail closed rather than replacing identity material.
+                if not registry.is_registered(record.key):
+                    raise
+        return identity
 
-    def create(self, network: str) -> InstanceRecord:
+    def create(self, network: str, name: str | None = None) -> InstanceRecord:
         records = self._read()
         configured_ids = {item.profile_id for item in load_profiles(self.profiles_dir).values()}
         used_ids = configured_ids | {item.profile_id for item in records}
@@ -171,6 +206,7 @@ class InstanceStore:
             raise ProfileError("no instance slots remain")
         if load_egress_definition(network, DEFAULT_EGRESS_DIR).name != network:
             raise ProfileError("selected network is not available")
+        display_name = _validate_realm_name(name or f"Zaap {len(records) + 1}", records)
         key = str(uuid.uuid4())
         instance_dir = self._instance_dir(key)
         instance_dir.mkdir(mode=0o700)
@@ -179,16 +215,33 @@ class InstanceStore:
         profile_id = available[0]
         record = InstanceRecord(
             key=key,
-            name=f"Zaap {len(records) + 1}",
-            profile_name=f"{self.base_profile.name}-i{profile_id}",
+            name=display_name,
+            profile_name=_realm_profile_name(display_name, profile_id),
             profile_id=profile_id,
             network=network,
             created_at=datetime.now(timezone.utc).isoformat(),
             display_backend="host",
         )
-        self.ensure_identity(record)
+        try:
+            self.ensure_identity(record)
+        except Exception:
+            # The directory was allocated only for this failed creation.
+            # Keep no partially-created identity or metadata record.
+            shutil.rmtree(instance_dir)
+            raise
         self.save(records + [record])
         return record
+
+    def clone(self, source: InstanceRecord, name: str | None = None) -> InstanceRecord:
+        """Create an independent realm from settings only, never its state.
+
+        The generated directory, persistent home, machine identity, registry
+        entry and application data are all fresh; cloning cannot copy tokens,
+        downloaded files, locks, or any other source-profile contents.
+        """
+        if source.key not in {item.key for item in self._read()}:
+            raise ProfileError("source GUI instance does not exist")
+        return self.create(source.network, name or f"{source.name} copy")
 
     def delete(self, record: InstanceRecord) -> None:
         instance_dir = self._instance_dir(record.key)
@@ -203,6 +256,9 @@ class InstanceStore:
         records = [item for item in self._read() if item.key != record.key]
         if len(records) == len(self._read()):
             raise ProfileError("GUI instance does not exist")
+        registry = IdentityRegistry(self.root / "identity-registry.sqlite3")
+        if registry.is_registered(record.key):
+            registry.retire(record.key)
         self.save(records)
         shutil.rmtree(instance_dir)
 

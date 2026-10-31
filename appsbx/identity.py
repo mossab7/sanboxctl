@@ -11,10 +11,8 @@ import tempfile
 import uuid
 
 from .hardware import (
-    MAX_SYNTHETIC_DISK_MB,
     HardwareProfile,
     generate_hardware,
-    legacy_hardware,
 )
 from .profile import Profile, ProfileError
 
@@ -36,6 +34,7 @@ class Identity:
     runtime_uid: int
     runtime_gid: int
     state_dir: Path
+    hardware_identity_uuid: str
 
     @property
     def cpu_count(self) -> int:
@@ -135,7 +134,7 @@ def _atomic_text(path: Path, value: str, mode: int = 0o600) -> None:
 
 
 def _new_identity(profile: Profile, state_dir: Path, hardware: HardwareProfile | None = None) -> Identity:
-    hardware = hardware or legacy_hardware(profile)
+    hardware = hardware or generate_hardware("random")
     return Identity(
         profile_name=profile.name,
         machine_id=secrets.token_hex(16),
@@ -144,6 +143,7 @@ def _new_identity(profile: Profile, state_dir: Path, hardware: HardwareProfile |
         runtime_uid=profile.runtime_uid,
         runtime_gid=profile.runtime_gid,
         state_dir=state_dir,
+        hardware_identity_uuid=str(uuid.UUID(bytes=secrets.token_bytes(16))),
     )
 
 
@@ -165,21 +165,20 @@ def _identity_from_json(data: dict, profile: Profile, state_dir: Path) -> Identi
     except (ValueError, AttributeError, TypeError) as exc:
         raise ProfileError("persisted boot_id is invalid") from exc
     hardware_data = data.get("hardware")
-    if hardware_data is None:
-        hardware = legacy_hardware(profile)
-    elif isinstance(hardware_data, dict):
+    if isinstance(hardware_data, dict):
         try:
             hardware = HardwareProfile.from_dict(hardware_data)
         except ValueError as exc:
             raise ProfileError(str(exc)) from exc
     else:
         raise ProfileError("persisted hardware profile is invalid")
-    if data.get("identity_mode", "persistent") == "persistent":
-        if hardware.hostname != profile.synthetic_hostname or hardware.mac != profile.synthetic_mac:
-            raise ProfileError("persisted identity does not match profile hardware identity")
-        if hardware.logical_cpus != profile.synthetic_cpu_count or hardware.ram_mb != profile.synthetic_ram_mb:
-            raise ProfileError("persisted identity does not match profile hardware limits")
-    return Identity(state_dir=state_dir, machine_id=machine_id, boot_id=boot_id, hardware=hardware, **expected)
+    hardware_uuid = data.get("hardware_identity_uuid")
+    try:
+        uuid.UUID(hardware_uuid)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ProfileError("persisted hardware identity UUID is invalid") from exc
+    return Identity(state_dir=state_dir, machine_id=machine_id, boot_id=boot_id, hardware=hardware,
+                    hardware_identity_uuid=hardware_uuid, **expected)
 
 
 def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
@@ -206,7 +205,7 @@ def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
         "run-machine-id": identity.machine_id + "\n",
         "hostname": identity.hostname + "\n",
         "hosts": f"127.0.0.1 localhost {identity.hostname}\n::1 localhost {identity.hostname}\n",
-        "os-release": 'NAME="appsbx"\nID=appsbx\nVERSION_ID="1"\nPRETTY_NAME="appsbx isolated Linux"\n',
+        "os-release": 'NAME="Linux"\nID=linux\nPRETTY_NAME="Linux"\n',
         "passwd": f"root:x:0:0:appsbx root:/root:/bin/sh\nappsbx:x:{identity.runtime_uid}:{identity.runtime_gid}:appsbx user:/home/appsbx:/bin/sh\n",
         "group": f"root:x:0:\nappsbx:x:{identity.runtime_gid}:\n",
         "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
@@ -231,13 +230,13 @@ def _render_files(identity: Identity, profile: Profile) -> dict[str, str]:
         "cpu-present": f"0-{identity.cpu_count - 1}\n",
         "dmi-sys-vendor": identity.hardware.bios_vendor + "\n",
         "dmi-product-name": identity.hardware.platform + "\n",
-        "dmi-product-version": "appsbx virtual platform\n",
+        "dmi-product-version": identity.hardware.catalog_id + "\n",
         "dmi-board-vendor": identity.hardware.bios_vendor + "\n",
         "dmi-board-name": identity.hardware.motherboard + "\n",
-        "dmi-product-serial": "APP-" + identity.machine_id[:12].upper() + "\n",
-        "dmi-product-uuid": identity.boot_id + "\n",
-        "dmi-board-serial": "BRD-" + identity.machine_id[12:24].upper() + "\n",
-        "dmi-chassis-serial": "CHS-" + identity.machine_id[24:].upper() + "\n",
+        "dmi-product-serial": identity.hardware.system_serial + "\n",
+        "dmi-product-uuid": identity.hardware_identity_uuid + "\n",
+        "dmi-board-serial": identity.hardware.board_serial + "\n",
+        "dmi-chassis-serial": identity.hardware.chassis_serial + "\n",
         "dmi-bios-vendor": identity.hardware.bios_vendor + "\n",
         "dmi-bios-version": identity.hardware.bios_version + "\n",
         "dmi-bios-date": identity.hardware.bios_date + "\n",
@@ -323,6 +322,7 @@ def ensure_identity(profile: Profile, state_root: Path) -> Identity:
             "profile_id": profile.profile_id,
             "machine_id": identity.machine_id,
             "boot_id": identity.boot_id,
+            "hardware_identity_uuid": identity.hardware_identity_uuid,
             "runtime_uid": identity.runtime_uid,
             "runtime_gid": identity.runtime_gid,
             "hardware": identity.hardware.to_dict(),
@@ -344,7 +344,7 @@ def ensure_identity(profile: Profile, state_root: Path) -> Identity:
 
 def create_auto_identity(profile: Profile, state_root: Path, hardware_class: str = "random") -> Identity:
     """Create a fresh, isolated identity directory for one launch."""
-    if hardware_class not in ("laptop", "desktop", "workstation", "random"):
+    if hardware_class not in ("laptop", "desktop", "gaming-desktop", "workstation", "random"):
         raise ProfileError("invalid hardware class")
     auto_root = state_root / ".auto"
     auto_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -363,6 +363,7 @@ def create_auto_identity(profile: Profile, state_root: Path, hardware_class: str
             "profile_id": profile.profile_id,
             "machine_id": identity.machine_id,
             "boot_id": identity.boot_id,
+            "hardware_identity_uuid": identity.hardware_identity_uuid,
             "runtime_uid": identity.runtime_uid,
             "runtime_gid": identity.runtime_gid,
             "hardware": identity.hardware.to_dict(),
@@ -382,7 +383,7 @@ def ensure_generated_identity(profile: Profile, state_dir: Path, hardware_class:
     This is used by the desktop controller, which owns a directory per named
     instance rather than the CLI's one-shot automatic identity directories.
     """
-    if hardware_class not in ("laptop", "desktop", "workstation", "random"):
+    if hardware_class not in ("laptop", "desktop", "gaming-desktop", "workstation", "random"):
         raise ProfileError("invalid hardware class")
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(state_dir, 0o700)
@@ -392,7 +393,6 @@ def ensure_generated_identity(profile: Profile, state_dir: Path, hardware_class:
             data = json.loads(identity_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise ProfileError("invalid generated identity") from exc
-        data = _migrate_oversized_generated_disk(data, identity_path)
         identity = _identity_from_json(data, profile, state_dir)
     else:
         identity = _new_identity(profile, state_dir, generate_hardware(hardware_class))
@@ -403,35 +403,12 @@ def ensure_generated_identity(profile: Profile, state_dir: Path, hardware_class:
             "profile_id": profile.profile_id,
             "machine_id": identity.machine_id,
             "boot_id": identity.boot_id,
+            "hardware_identity_uuid": identity.hardware_identity_uuid,
             "runtime_uid": identity.runtime_uid,
             "runtime_gid": identity.runtime_gid,
             "hardware": identity.hardware.to_dict(),
         }, sort_keys=True, indent=2) + "\n")
     return _materialize_generated_identity(identity, profile)
-
-
-def _migrate_oversized_generated_disk(data: dict, identity_path: Path) -> dict:
-    """Repair the one oversized disk value emitted by catalog versions <= 41.
-
-    The old workstation variants persisted 1,920,000 MiB even though the
-    sandbox's synthetic df implementation deliberately supports at most
-    1,048,576 MiB.  These identities never launched successfully, so reducing
-    only their disk capacity to a plausible 960 GB preserves every stable
-    identity attribute while making /sys and df internally consistent.
-    """
-    hardware = data.get("hardware")
-    if (
-        data.get("identity_mode") != "auto"
-        or not isinstance(hardware, dict)
-        or hardware.get("disk_size_mb") != 1_920_000
-    ):
-        return data
-    migrated = dict(data)
-    migrated_hardware = dict(hardware)
-    migrated_hardware["disk_size_mb"] = min(960_000, MAX_SYNTHETIC_DISK_MB)
-    migrated["hardware"] = migrated_hardware
-    _atomic_text(identity_path, json.dumps(migrated, sort_keys=True, indent=2) + "\n")
-    return migrated
 
 
 def _materialize_generated_identity(identity: Identity, profile: Profile) -> Identity:

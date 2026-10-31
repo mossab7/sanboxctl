@@ -21,7 +21,7 @@ from .network import (
     resource_names, write_dns_resolv_conf,
 )
 from .paths import PROJECT_ROOT, state_root
-from .profile import ProfileError, load_profiles
+from .profile import NAME_RE, ProfileError, load_profiles
 from .probe import category_report, current_observations, host_denylist, leak_categories
 from .rootfs import inspect_appimage
 from .runtime import build_vnc_bridge_command, prepare_plan
@@ -86,6 +86,18 @@ def _instance_profile(profile, instance_id: int | None):
     return replace(profile, name=profile.name + suffix, profile_id=instance_id)
 
 
+def _named_instance_profile(profile, instance_id: int | None, profile_name: str | None):
+    profile = _instance_profile(profile, instance_id)
+    if profile_name is None:
+        return profile
+    # GUI-managed identities live outside profiles/. Preserve the base
+    # profile's runtime policy while using the exact safe name recorded in
+    # that identity, rather than reconstructing example-i<ID>.
+    if not NAME_RE.fullmatch(profile_name):
+        raise ProfileError("--profile-name is invalid")
+    return replace(profile, name=profile_name)
+
+
 def cmd_profile(args: argparse.Namespace) -> int:
     profiles = _profiles()
     if args.action == "list":
@@ -128,7 +140,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         conflict = next((item.name for item in _profiles().values() if item.profile_id == args.instance_id), None)
         if conflict is not None:
             raise ProfileError(f"--instance-id {args.instance_id} conflicts with configured profile {conflict}")
-    profile = _instance_profile(profile, args.instance_id)
+    profile = _named_instance_profile(profile, args.instance_id, args.profile_name)
     if args.identity_dir:
         try:
             identity_dir = Path(args.identity_dir).resolve(strict=True)
@@ -322,6 +334,7 @@ def parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run")
     run.add_argument("--profile", required=True)
+    run.add_argument("--profile-name", help=argparse.SUPPRESS)
     run.add_argument(
         "--instance-id", type=int,
         help="independent per-instance resource ID (0-253; use a unique value for concurrent runs)",
@@ -336,7 +349,7 @@ def parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     run.add_argument(
-        "--hardware-class", choices=["laptop", "desktop", "workstation", "random"],
+        "--hardware-class", choices=["laptop", "desktop", "gaming-desktop", "workstation", "random"],
         help="compatible hardware family for --identity auto",
     )
     run.add_argument("--egress")

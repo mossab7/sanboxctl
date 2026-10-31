@@ -1,30 +1,35 @@
-"""Compatible synthetic hardware profiles.
+"""Versioned, compatible synthetic desktop hardware catalog.
 
-The catalog is deliberately made of complete platform variants.  We choose a
-variant first and only then choose among values that are valid for that
-variant; CPU, board, firmware, GPU, storage, and network hardware are never
-mixed independently.
+The source catalog describes documented *platform families*. At load time a
+family expands only across its declared firmware, memory and storage options.
+This provides many usable configurations without claiming every combination
+was sold as a separate retail SKU.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
 import re
 import secrets
 from typing import Any
 
 
-HARDWARE_CLASSES = ("laptop", "desktop", "workstation", "random")
-
-# The synthetic ``df`` helper and the staged /sys block-device view use MiB.
-# Keep automatic identities within this ceiling so identity materialization can
-# never fail after an otherwise valid profile has already been persisted.
+HARDWARE_CLASSES = ("laptop", "desktop", "gaming-desktop", "workstation", "random")
+CATALOG_SCHEMA_VERSION = 1
+CATALOG_PATH = Path(__file__).resolve().parents[1] / "catalog" / "hardware_templates.json"
 MIN_SYNTHETIC_DISK_MB = 128_000
 MAX_SYNTHETIC_DISK_MB = 1_048_576
 
 
 @dataclass(frozen=True)
 class HardwareProfile:
+    """One complete synthetic platform identity, persisted per instance."""
+
+    catalog_id: str
+    catalog_schema_version: int
+    evidence_url: str
     hardware_class: str
     platform: str
     cpu_vendor: str
@@ -36,6 +41,8 @@ class HardwareProfile:
     logical_cpus: int
     cpu_mhz: int
     cache_kb: int
+    socket: str
+    chipset: str
     ram_mb: int
     gpu: str
     motherboard: str
@@ -45,6 +52,9 @@ class HardwareProfile:
     disk_model: str
     disk_size_mb: int
     disk_serial: str
+    system_serial: str
+    board_serial: str
+    chassis_serial: str
     network_adapter: str
     mac: str
     hostname: str
@@ -63,7 +73,11 @@ class HardwareProfile:
 
 
 @dataclass(frozen=True)
-class _Variant:
+class CatalogConfiguration:
+    """A compatible configuration expanded from one platform family."""
+
+    catalog_id: str
+    evidence_url: str
     hardware_class: str
     platform: str
     cpu_vendor: str
@@ -75,27 +89,98 @@ class _Variant:
     logical_cpus: int
     cpu_mhz: int
     cache_kb: int
-    ram_options: tuple[int, ...]
+    socket: str
+    chipset: str
+    ram_mb: int
     gpu: str
     motherboard: str
     bios_vendor: str
-    bios_versions: tuple[str, ...]
+    bios_version: str
     bios_date: str
-    disk_options: tuple[tuple[str, int], ...]
+    disk_model: str
+    disk_size_mb: int
     network_adapter: str
 
 
-# These are coherent platform families, not claims about a particular host.
-# The identifiers are public model names and the per-instance serial/MAC/
-# hostname values are generated below.
-CATALOG: tuple[_Variant, ...] = (
-    _Variant("laptop", "Dell Latitude 5420", "GenuineIntel", "11th Gen Intel(R) Core(TM) i5-1145G7", 6, 140, 1, 4, 8, 2600, 8192, (8192, 16384), "Intel Iris Xe Graphics", "Dell 0H0YVY", "Dell Inc.", ("1.18.0", "1.24.0"), "2023-05-12", (("KIOXIA KBG40ZNS512G", 512000), ("WDC PC SN530 SDBPZK-512G", 512000)), "Intel Wi-Fi 6 AX201"),
-    _Variant("laptop", "Lenovo ThinkPad T14 Gen 2 AMD", "AuthenticAMD", "AMD Ryzen 5 PRO 5650U with Radeon Graphics", 25, 80, 0, 6, 12, 2300, 16384, (16384, 32768), "AMD Radeon Graphics", "Lenovo 20XK", "LENOVO", ("R1BET62W", "R1MET62W"), "2023-02-08", (("SAMSUNG MZVLQ512HALU-00BL2", 512000), ("SK hynix PC711", 512000)), "Intel Wi-Fi 6 AX200"),
-    _Variant("desktop", "HP EliteDesk 800 G6", "GenuineIntel", "12th Gen Intel(R) Core(TM) i7-12700", 6, 151, 2, 12, 20, 3600, 25600, (16384, 32768, 65536), "Intel UHD Graphics 770", "HP 8906", "HP", ("02.17.00", "02.20.00"), "2023-11-03", (("WD_BLACK SN770", 1000000), ("Samsung SSD 980 PRO", 1000000)), "Intel Ethernet Controller I225-V"),
-    _Variant("desktop", "MSI MAG B550 Tomahawk", "AuthenticAMD", "AMD Ryzen 7 5800X 8-Core Processor", 25, 33, 0, 8, 16, 3800, 32768, (16384, 32768, 65536), "NVIDIA GeForce RTX 3060", "MSI MS-7C91", "American Megatrends International", ("A.90", "A.A0"), "2023-08-21", (("Crucial P5 Plus", 1000000), ("SAMSUNG MZ-V8P1T0", 1000000)), "Realtek RTL8125 2.5GbE"),
-    _Variant("workstation", "Lenovo ThinkStation P620", "AuthenticAMD", "AMD Ryzen Threadripper PRO 3955WX 16-Cores", 25, 1, 0, 16, 32, 3900, 65536, (65536, 131072), "NVIDIA RTX A4000", "Lenovo 1036", "LENOVO", ("S07KT1B", "S07KT2B"), "2022-10-14", (("Samsung PM983", 960000), ("KIOXIA CD6", 960000)), "Intel Ethernet Connection I219-LM"),
-    _Variant("workstation", "Dell Precision 5820 Tower", "GenuineIntel", "Intel(R) Xeon(R) W-2245 CPU", 6, 85, 7, 8, 16, 3900, 16384, (32768, 65536), "NVIDIA Quadro P2200", "Dell 0F5C5X", "Dell Inc.", ("2.13.0", "2.15.0"), "2022-06-16", (("Intel SSD D3-S4510", 960000), ("Micron 5300 PRO", 960000)), "Intel Ethernet I210"),
-)
+def _require(raw: dict[str, Any], key: str, type_: type) -> Any:
+    value = raw.get(key)
+    if not isinstance(value, type_):
+        raise ValueError(f"hardware catalog entry is missing valid {key}")
+    return value
+
+
+def load_catalog(path: Path = CATALOG_PATH) -> tuple[CatalogConfiguration, ...]:
+    """Load documented platform families and expand them into >=300 variants."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"cannot load hardware catalog: {path}") from exc
+    if raw.get("schema_version") != CATALOG_SCHEMA_VERSION:
+        raise RuntimeError("unsupported hardware catalog schema")
+    templates = raw.get("templates")
+    if not isinstance(templates, list) or not templates:
+        raise RuntimeError("hardware catalog contains no platform templates")
+
+    expanded: list[CatalogConfiguration] = []
+    identifiers: set[str] = set()
+    for template in templates:
+        if not isinstance(template, dict):
+            raise RuntimeError("hardware catalog template must be an object")
+        identifier = _require(template, "id", str)
+        if identifier in identifiers or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", identifier):
+            raise RuntimeError("hardware catalog identifiers must be unique slugs")
+        identifiers.add(identifier)
+        hardware_class = _require(template, "class", str)
+        if hardware_class not in HARDWARE_CLASSES[:-1]:
+            raise RuntimeError(f"unsupported catalog hardware class: {hardware_class}")
+        disks = _require(template, "disks", list)
+        bios_versions = _require(template, "bios", list)
+        ram_options = _require(template, "ram", list)
+        if not all(isinstance(item, str) and item for item in bios_versions):
+            raise RuntimeError(f"invalid firmware options for {identifier}")
+        if not all(isinstance(item, int) and item >= 4096 and item % 1024 == 0 for item in ram_options):
+            raise RuntimeError(f"invalid memory options for {identifier}")
+        if not all(isinstance(item, list) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], int)
+                   for item in disks):
+            raise RuntimeError(f"invalid disk options for {identifier}")
+        fixed = {
+            "platform": _require(template, "platform", str),
+            "cpu_vendor": _require(template, "cpu_vendor", str),
+            "cpu_model": _require(template, "cpu", str),
+            "cpu_family": _require(template, "family", int),
+            "cpu_model_id": _require(template, "model", int),
+            "cpu_stepping": _require(template, "stepping", int),
+            "physical_cores": _require(template, "cores", int),
+            "logical_cpus": _require(template, "threads", int),
+            "cpu_mhz": _require(template, "mhz", int),
+            "cache_kb": _require(template, "cache_kb", int),
+            "socket": _require(template, "socket", str),
+            "chipset": _require(template, "chipset", str),
+            "gpu": _require(template, "gpu", str),
+            "motherboard": _require(template, "board", str),
+            "bios_vendor": _require(template, "bios_vendor", str),
+            "bios_date": _require(template, "date", str),
+            "network_adapter": _require(template, "nic", str),
+            "evidence_url": _require(template, "source", str),
+        }
+        if fixed["logical_cpus"] < fixed["physical_cores"]:
+            raise RuntimeError(f"inconsistent CPU topology in {identifier}")
+        for ram_mb in ram_options:
+            for disk_model, disk_size_mb in disks:
+                if not MIN_SYNTHETIC_DISK_MB <= disk_size_mb <= MAX_SYNTHETIC_DISK_MB:
+                    raise RuntimeError(f"unsupported synthetic disk capacity in {identifier}")
+                for bios_version in bios_versions:
+                    expanded.append(CatalogConfiguration(
+                        catalog_id=identifier, hardware_class=hardware_class, ram_mb=ram_mb,
+                        disk_model=disk_model, disk_size_mb=disk_size_mb, bios_version=bios_version,
+                        **fixed,
+                    ))
+    if len(expanded) < 300:
+        raise RuntimeError("hardware catalog must expand to at least 300 configurations")
+    return tuple(expanded)
+
+
+CATALOG = load_catalog()
 
 
 def _mac() -> str:
@@ -104,19 +189,35 @@ def _mac() -> str:
     return ":".join(f"{item:02x}" for item in raw)
 
 
-def _serial() -> str:
-    return "APP" + secrets.token_hex(7).upper()
+def _token(length: int) -> str:
+    return "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ0123456789") for _ in range(length))
+
+
+def _manufacturer_serial(vendor: str, kind: str) -> str:
+    """Generate OEM-shaped serials without encoding app, profile, or host data."""
+    normalized = vendor.upper()
+    if "LENOVO" in normalized:
+        return f"PF-{_token(8)}"
+    if "DELL" in normalized:
+        return _token(7)
+    if "HP" in normalized:
+        return _token(10)
+    if "AMERICAN" in normalized or "MSI" in normalized or "ASUS" in normalized:
+        return _token(12)
+    return _token(10 if kind == "system" else 12)
 
 
 def _hostname(hardware_class: str) -> str:
-    return f"sbx-{hardware_class}-{secrets.token_hex(4)}"
+    return f"{'LAPTOP' if hardware_class == 'laptop' else 'DESKTOP'}-{_token(7)}"
 
 
 def validate_hardware(profile: HardwareProfile) -> None:
-    if profile.hardware_class == "legacy":
-        return
+    if profile.catalog_schema_version != CATALOG_SCHEMA_VERSION:
+        raise ValueError("unsupported hardware profile catalog schema")
     if profile.hardware_class not in HARDWARE_CLASSES[:-1]:
         raise ValueError("invalid hardware class")
+    if profile.catalog_id not in {item.catalog_id for item in CATALOG}:
+        raise ValueError("unknown hardware catalog entry")
     if profile.physical_cores < 1 or profile.logical_cpus < profile.physical_cores:
         raise ValueError("inconsistent CPU core counts")
     if profile.ram_mb < 4096 or profile.ram_mb % 1024:
@@ -128,70 +229,42 @@ def validate_hardware(profile: HardwareProfile) -> None:
     first = int(profile.mac[:2], 16)
     if first & 1 or not first & 2:
         raise ValueError("generated MAC is not locally administered and unicast")
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", profile.hostname):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", profile.hostname.lower()):
         raise ValueError("invalid generated hostname")
+    for value in (profile.disk_serial, profile.system_serial, profile.board_serial, profile.chassis_serial):
+        if not re.fullmatch(r"[A-Z0-9-]{7,16}", value):
+            raise ValueError("invalid synthetic manufacturer serial")
 
 
 def generate_hardware(hardware_class: str = "random") -> HardwareProfile:
     if hardware_class not in HARDWARE_CLASSES:
         raise ValueError(f"hardware class must be one of: {', '.join(HARDWARE_CLASSES)}")
-    choices = CATALOG if hardware_class == "random" else tuple(item for item in CATALOG if item.hardware_class == hardware_class)
-    variant = secrets.choice(choices)
-    disk_model, disk_size_mb = secrets.choice(variant.disk_options)
+    choices = CATALOG if hardware_class == "random" else tuple(
+        item for item in CATALOG
+        if item.hardware_class == hardware_class
+        # Gaming desktop platforms are also valid conventional desktop PCs.
+        # This is a selection alias, never a component mix or a new catalog
+        # record; the persisted class remains the documented gaming-desktop.
+        or (hardware_class == "desktop" and item.hardware_class == "gaming-desktop")
+    )
+    if not choices:
+        raise ValueError(f"catalog contains no {hardware_class} configurations")
+    item = secrets.choice(choices)
     result = HardwareProfile(
-        hardware_class=variant.hardware_class,
-        platform=variant.platform,
-        cpu_vendor=variant.cpu_vendor,
-        cpu_model=variant.cpu_model,
-        cpu_family=variant.cpu_family,
-        cpu_model_id=variant.cpu_model_id,
-        cpu_stepping=variant.cpu_stepping,
-        physical_cores=variant.physical_cores,
-        logical_cpus=variant.logical_cpus,
-        cpu_mhz=variant.cpu_mhz,
-        cache_kb=variant.cache_kb,
-        ram_mb=secrets.choice(variant.ram_options),
-        gpu=variant.gpu,
-        motherboard=variant.motherboard,
-        bios_vendor=variant.bios_vendor,
-        bios_version=secrets.choice(variant.bios_versions),
-        bios_date=variant.bios_date,
-        disk_model=disk_model,
-        disk_size_mb=disk_size_mb,
-        disk_serial=_serial(),
-        network_adapter=variant.network_adapter,
-        mac=_mac(),
-        hostname=_hostname(variant.hardware_class),
+        catalog_id=item.catalog_id, catalog_schema_version=CATALOG_SCHEMA_VERSION,
+        evidence_url=item.evidence_url, hardware_class=item.hardware_class,
+        platform=item.platform, cpu_vendor=item.cpu_vendor, cpu_model=item.cpu_model,
+        cpu_family=item.cpu_family, cpu_model_id=item.cpu_model_id, cpu_stepping=item.cpu_stepping,
+        physical_cores=item.physical_cores, logical_cpus=item.logical_cpus,
+        cpu_mhz=item.cpu_mhz, cache_kb=item.cache_kb, socket=item.socket, chipset=item.chipset,
+        ram_mb=item.ram_mb, gpu=item.gpu, motherboard=item.motherboard,
+        bios_vendor=item.bios_vendor, bios_version=item.bios_version, bios_date=item.bios_date,
+        disk_model=item.disk_model, disk_size_mb=item.disk_size_mb,
+        disk_serial=_manufacturer_serial(item.bios_vendor, "disk"),
+        system_serial=_manufacturer_serial(item.bios_vendor, "system"),
+        board_serial=_manufacturer_serial(item.bios_vendor, "board"),
+        chassis_serial=_manufacturer_serial(item.bios_vendor, "chassis"),
+        network_adapter=item.network_adapter, mac=_mac(), hostname=_hostname(item.hardware_class),
     )
     validate_hardware(result)
-    return result
-
-
-def legacy_hardware(profile: Any) -> HardwareProfile:
-    """Represent an existing TOML profile without changing its behavior."""
-    result = HardwareProfile(
-        hardware_class="legacy",
-        platform="Configured appsbx profile",
-        cpu_vendor="appsbx",
-        cpu_model="appsbx synthetic CPU",
-        cpu_family=99,
-        cpu_model_id=1,
-        cpu_stepping=1,
-        physical_cores=profile.synthetic_cpu_count,
-        logical_cpus=profile.synthetic_cpu_count,
-        cpu_mhz=1000,
-        cache_kb=1024,
-        ram_mb=profile.synthetic_ram_mb,
-        gpu="appsbx synthetic GPU",
-        motherboard="appsbx synthetic motherboard",
-        bios_vendor="appsbx",
-        bios_version="1",
-        bios_date="1970-01-01",
-        disk_model="appsbx synthetic disk",
-        disk_size_mb=profile.synthetic_disk_mb,
-        disk_serial="CONFIGURED",
-        network_adapter="appsbx synthetic network adapter",
-        mac=profile.synthetic_mac,
-        hostname=profile.synthetic_hostname,
-    )
     return result
