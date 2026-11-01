@@ -273,6 +273,10 @@ def prepare_plan(
         argv.extend(["--dir", "/tmp/.X11-unix", "--bind", str(socket_dir), "/tmp/.X11-unix"])
     profile_home = ensure_profile_home(identity).resolve()
     runtime_root = runtime_bundle.root
+    pixbuf_caches = sorted(runtime_root.glob("usr/lib*/**/gdk-pixbuf-2.0/*/loaders.cache"))
+    if len(pixbuf_caches) > 1:
+        raise ValueError("runtime bundle has ambiguous GDK-pixbuf loader caches")
+    pixbuf_cache = pixbuf_caches[0] if pixbuf_caches else None
     syscall_guard = runtime_root / "usr" / "lib" / "appsbx" / GUARD_NAME
     if not syscall_guard.is_file() or syscall_guard.is_symlink():
         raise ValueError("runtime bundle is missing its uname/sysinfo guard")
@@ -322,6 +326,14 @@ def prepare_plan(
         "--setenv", "XLOCALEDIR", "/usr/share/X11/locale",
         "--chdir", "/home/appsbx", "--",
     ])
+    if pixbuf_cache is not None:
+        # The cache uses paths valid inside the staged /usr tree.  Pin it so
+        # GTK never probes an absent host cache when Electron opens a native
+        # folder chooser.
+        separator = argv.index("--")
+        argv[separator:separator] = [
+            "--setenv", "GDK_PIXBUF_MODULE_FILE", "/" + str(pixbuf_cache.relative_to(runtime_root)),
+        ]
     if shared_game_root is not None:
         try:
             shared_game_root = shared_game_root.resolve(strict=True)

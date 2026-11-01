@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,13 +19,30 @@ class ApplicationStoreTests(unittest.TestCase):
         executable.chmod(0o755)
         data = root / "resources.pak"
         data.write_bytes(b"content")
+        release = root / "main"
+        release.write_text("main\n", encoding="ascii")
         manifest = {
             "dofus1electron": {"size": executable.stat().st_size},
             "resources.pak": {"size": data.stat().st_size},
+            "main": {"size": release.stat().st_size},
         }
         (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         # This resembles launcher-local state and must not be imported.
         (root / "migration.launcher.json").write_text('{"launcher":1}', encoding="utf-8")
+        repository = home / ".config/zaap/repositories/production/retro/main"
+        repository.mkdir(parents=True)
+        (repository / "release.json").write_text(json.dumps({
+            "_schemaVersion": 1,
+            "gameId": 101,
+            "gameName": "Retro",
+            "gameOrder": 2,
+            "gameUid": "retro",
+            "location": "/home/source/.config/Ankama/Retro",
+            "isInstalling": False,
+            "repositoryVersion": "6.0_1.49.9.5673.465-64394b4",
+            "version": "6.0_1.49.9.5673.465-64394b4",
+            "accountToken": "must-not-cross-realms",
+        }), encoding="utf-8")
         return root
 
     def test_import_is_immutable_and_excludes_unlisted_state(self):
@@ -36,9 +54,57 @@ class ApplicationStoreTests(unittest.TestCase):
             self.assertEqual(store.game_root(), imported)
             self.assertTrue((imported / "dofus1electron").is_file())
             self.assertFalse((imported / "migration.launcher.json").exists())
+            self.assertFalse((imported / ".release.infos.json").exists())
             self.assertFalse(imported.stat().st_mode & 0o022)
             self.assertEqual((imported / "resources.pak").read_bytes(), b"content")
             self.assertEqual(imported, store.import_retro(root / "private-home"))
+
+    def test_materialized_game_is_private_writable_and_has_release_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ApplicationStore(root / "state")
+            # Keep the fixture construction explicit: the managed seed is
+            # populated from one realm, while the second receives no files
+            # except the approved manifest payload and release selector.
+            self._game(root / "source-home")
+            shared = store.import_retro(root / "source-home")
+            second_home = root / "second-home"
+            second_home.mkdir(mode=0o700)
+            view = store.materialize_retro(second_home)
+            self.assertTrue((view / "dofus1electron").is_file())
+            self.assertEqual(
+                json.loads((view / ".release.infos.json").read_text(encoding="utf-8")),
+                {"gameUid": "retro", "release": "main"},
+            )
+            self.assertFalse((view / "migration.launcher.json").exists())
+            self.assertNotEqual(view.resolve(), shared.resolve())
+            self.assertTrue(os.access(view, os.W_OK))
+            # The second materialization is idempotent and does not replace
+            # data that Zaap has created inside its own private view.
+            marker = view / "zaap-private-state"
+            marker.write_text("realm-only", encoding="ascii")
+            self.assertEqual(store.materialize_retro(second_home), view)
+            self.assertEqual(marker.read_text(encoding="ascii"), "realm-only")
+
+    def test_materialization_seeds_only_public_retro_install_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ApplicationStore(root / "state")
+            self._game(root / "source-home")
+            store.import_retro(root / "source-home")
+            second = root / "second-home"
+            second.mkdir(mode=0o700)
+            store.materialize_retro(second)
+            record_path = second / ".config/zaap/repositories/production/retro/main/release.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["location"], "/home/appsbx/.config/Ankama/Retro")
+            self.assertEqual(record["gameUid"], "retro")
+            self.assertNotIn("accountToken", record)
+            self.assertFalse((second / ".config/zaap/Settings").exists())
+            # A launcher-owned record must not be overwritten at later runs.
+            record_path.write_text('{"launcher":"owns-this"}', encoding="utf-8")
+            store.materialize_retro(second)
+            self.assertEqual(json.loads(record_path.read_text(encoding="utf-8")), {"launcher": "owns-this"})
 
     def test_import_rejects_manifest_escape_or_missing_payload(self):
         with tempfile.TemporaryDirectory() as directory:

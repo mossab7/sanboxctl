@@ -40,7 +40,7 @@ DT_STRSZ = 10
 DT_RPATH = 15
 DT_RUNPATH = 29
 # Bump whenever the staged runtime contract changes.
-BUNDLE_VERSION = 47
+BUNDLE_VERSION = 49
 VNC_BUNDLE_VERSION = 1
 GOOGLE_CHROME_ROOT = Path("/opt/google/chrome")
 GOOGLE_CHROME_EXECUTABLE = GOOGLE_CHROME_ROOT / "chrome"
@@ -992,6 +992,13 @@ def prepare_runtime_bundle(
                 pixbuf_loaders = pixbuf_dir / "loaders"
                 if pixbuf_loaders.is_dir():
                     _stage_resource_tree(pixbuf_loaders, temporary, SYSTEM_LIBRARY_ROOTS)
+                    # Loader modules are dlopened from loaders.cache, so their
+                    # dependencies are not part of Electron's ELF closure.
+                    # Stage the closure explicitly; otherwise GTK's native
+                    # file chooser can abort while decoding its fallback icon.
+                    for loader in pixbuf_loaders.glob("*.so"):
+                        _stage_host_path(loader, temporary, staged)
+                        queue.append(loader)
                 pixbuf_cache = pixbuf_dir / "loaders.cache"
                 if pixbuf_cache.is_file():
                     _stage_regular_file(pixbuf_cache, temporary, SYSTEM_LIBRARY_ROOTS)
@@ -1019,12 +1026,21 @@ def prepare_runtime_bundle(
                     _stage_resource_tree(resource, temporary, data_roots)
                 elif resource.is_file():
                     _stage_regular_file(resource, temporary, data_roots)
-            # Native Wayland/GTK initialization asks GDK-pixbuf to load its
-            # standard missing-image icon.  This small fixed icon subset is
-            # data-only and does not expose the host desktop or credentials.
-            adwaita_status = Path("/usr/share/icons/Adwaita/48x48/status")
-            if adwaita_status.is_dir():
-                _stage_resource_tree(adwaita_status, temporary, (Path("/usr/share/icons"),))
+            # Electron's GTK file chooser resolves named place/action icons,
+            # then falls back to GTK's embedded ``image-missing.png``.  The
+            # previous status-only subset omitted both the Adwaita index (and
+            # its hicolor inheritance) and the named place icons, causing GTK
+            # to abort instead of merely showing a fallback glyph.  Icon and
+            # MIME assets are static package data: staging them creates no
+            # display-server, home-directory, or credential exposure.
+            icon_root = Path("/usr/share/icons")
+            for theme in ("Adwaita", "hicolor"):
+                theme_root = icon_root / theme
+                if theme_root.is_dir():
+                    _stage_resource_tree(theme_root, temporary, (icon_root,))
+            mime_root = Path("/usr/share/mime")
+            if mime_root.is_dir():
+                _stage_resource_tree(mime_root, temporary, (Path("/usr/share"),))
             queue.extend(helpers)
         if gpu_info is not None:
             _write_gpu_sysfs_view(temporary, gpu_info)

@@ -226,20 +226,32 @@ def cmd_run(args: argparse.Namespace) -> int:
     if url_broker == "browser" and display_backend not in {"xvfb", "host"}:
         raise ProfileError("--url-broker browser requires --display host, xvfb, or xvfb-vnc")
     application_store = ApplicationStore(STATE)
-    shared_game_root = None if args.private_game else application_store.game_root()
-    if shared_game_root is None and not args.private_game:
+    shared_snapshot = None if args.private_game else application_store.game_root()
+    if shared_snapshot is None and not args.private_game:
         # The first realm still performs the official download in its own
         # private HOME. Once it has completed and the launcher is restarted,
         # promote only manifest-listed program files into the immutable store.
         try:
-            shared_game_root = application_store.import_retro(identity.home_dir)
+            shared_snapshot = application_store.import_retro(identity.home_dir)
             print("[APPSBX GAME] activated verified shared Dofus payload", flush=True)
         except ProfileError:
             pass
+    if shared_snapshot is not None and not args.private_game:
+        # Zaap writes its release marker beside the official payload.  Mounting
+        # the shared snapshot read-only made a second realm see a non-empty
+        # folder but classify it as uninstalled.  Materialize verified program
+        # bytes into this realm's persistent HOME instead; it is reflinked on
+        # supported filesystems and otherwise copied, never shared writable.
+        # The atomic directory replacement protects readers; the short lock
+        # also prevents two launch requests for the same realm from both
+        # attempting an initial materialization.
+        with profile_lock(state_scope):
+            game_view = application_store.materialize_retro(identity.home_dir)
+        print(f"[APPSBX GAME] prepared private Dofus view: {game_view}", flush=True)
     runtime_bundle = prepare_runtime_bundle(
         app_root, command, identity.state_dir, display_backend,
         identity.hardware.disk_size_mb, url_broker == "browser",
-        gpu_info, args.trace_hardware, shared_game_root,
+        gpu_info, args.trace_hardware,
     )
     payload_command = command
     if args.trace_hardware:
@@ -270,7 +282,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             host_display=host_display,
             gpu_mode=args.gpu_mode, gpu_info=gpu_info,
             trace_payload=args.trace_hardware,
-            shared_game_root=shared_game_root,
         )
         if private_display is not None:
             bridge = build_vnc_bridge_command(
@@ -291,7 +302,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # private game directory.  Only after Zaap exits cleanly do we inspect
         # its manifest and atomically publish program files to the shared
         # read-only store. Credentials and launcher state stay in this realm.
-        if status == 0 and (shared_game_root is None or args.private_game):
+        if status == 0 and (shared_snapshot is None or args.private_game):
             try:
                 promoted = application_store.import_retro(identity.home_dir)
                 print(f"[APPSBX GAME] activated verified shared Dofus payload: {promoted}", flush=True)

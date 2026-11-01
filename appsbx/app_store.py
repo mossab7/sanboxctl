@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+import fcntl
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -23,6 +24,8 @@ from .rootfs import RootfsError, extract_appimage, inspect_appimage
 STORE_MARKER = ".appsbx-game-store"
 LAUNCHER_MARKER = ".appsbx-launcher-store"
 GAME_RELATIVE = Path(".config/Ankama/Retro")
+GAME_VIEW_MARKER = ".appsbx-game-view.json"
+RETRO_REPOSITORY_RELATIVE = Path(".config/zaap/repositories/production/retro")
 # The old support-page endpoint now redirects to an account-gated web page.
 # This is the current Ankama-owned production artifact endpoint.
 OFFICIAL_LAUNCHER_URL = (
@@ -243,6 +246,229 @@ class ApplicationStore:
         except (OSError, ValueError, TypeError):
             return None
 
+    def _current_data(self) -> dict[str, object] | None:
+        try:
+            data = json.loads(self.current.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _write_current(self, snapshot: str, manifest: Path, repository_release: dict[str, object] | None) -> None:
+        """Atomically record an immutable seed and safe, public install state."""
+        data: dict[str, object] = {
+            "snapshot": snapshot,
+            "manifest_sha256": _sha256(manifest),
+        }
+        if repository_release is not None:
+            data["repository_release"] = repository_release
+        temporary = self.current.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.current)
+
+    @staticmethod
+    def _repository_release(source_home: Path, release: str) -> dict[str, object] | None:
+        """Read only Zaap's public Retro installation record.
+
+        This deliberately reconstructs a small allow-list instead of copying
+        the repository directory.  In particular, account settings, tokens,
+        cookies, and the launcher database are not shared with another realm.
+        """
+        if not release or len(release) > 64:
+            return None
+        path = source_home / RETRO_REPOSITORY_RELATIVE / release / "release.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(raw, dict) or raw.get("gameUid") != "retro":
+            return None
+        version = raw.get("version")
+        repository_version = raw.get("repositoryVersion", version)
+        if not isinstance(version, str) or not isinstance(repository_version, str):
+            return None
+        allowed_version = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        if (not version or not repository_version or len(version) > 128 or len(repository_version) > 128
+                or any(char not in allowed_version for char in version + repository_version)):
+            return None
+        game_id = raw.get("gameId", 101)
+        game_order = raw.get("gameOrder", 2)
+        if not isinstance(game_id, int) or not isinstance(game_order, int):
+            return None
+        record = {
+            "_schemaVersion": 1,
+            "gameId": game_id,
+            "gameName": "Retro",
+            "gameOrder": game_order,
+            "gameUid": "retro",
+            # This is the sandbox-visible location, never a source realm path.
+            "location": "/home/appsbx/.config/Ankama/Retro",
+            "isInstalling": False,
+            "repositoryVersion": repository_version,
+            "version": version,
+        }
+        return {"release": release, "record": record}
+
+    @staticmethod
+    def _seed_repository_release(home: Path, data: dict[str, object] | None) -> None:
+        """Seed the safe per-realm installation record without overwriting it."""
+        if data is None:
+            return
+        envelope = data.get("repository_release")
+        if not isinstance(envelope, dict):
+            return
+        release = envelope.get("release")
+        record = envelope.get("record")
+        if (not isinstance(release, str) or not release or len(release) > 64
+                or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for char in release)
+                or not isinstance(record, dict) or record.get("gameUid") != "retro"):
+            return
+        target = home / RETRO_REPOSITORY_RELATIVE / release / "release.json"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            parent = target.parent.resolve(strict=True)
+            home_root = home.resolve(strict=True)
+        except OSError as exc:
+            raise ProfileError("profile launcher repository is unavailable") from exc
+        if not _inside(parent, home_root) or target.is_symlink():
+            raise ProfileError("profile launcher repository is unsafe")
+        if target.exists():
+            return
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+
+    @staticmethod
+    def _release_descriptor(snapshot: Path) -> dict[str, str] | None:
+        """Return the non-secret release selector carried by the payload.
+
+        Zaap writes ``.release.infos.json`` before deciding whether a populated
+        Retro directory is installed.  That file is launcher state, so it does
+        not belong in the shared snapshot.  The official payload's small
+        ``main`` selector is enough to construct the same per-realm marker.
+        """
+        try:
+            release = (snapshot / "main").read_text(encoding="ascii").strip()
+        except OSError:
+            return None
+        if not release or len(release) > 64 or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for char in release):
+            return None
+        return {"gameUid": "retro", "release": release}
+
+    @staticmethod
+    def _copy_reflink_or_copy(source: Path, destination: Path) -> bool:
+        """Copy a regular payload file, preferring a filesystem CoW reflink.
+
+        Reflinks retain per-realm write isolation while avoiding duplicated
+        blocks on btrfs/XFS and other supporting filesystems.  A byte copy is
+        the portable fallback; neither path ever links mutable files between
+        realms.
+        """
+        # Linux's FICLONE ioctl.  Keep the numeric ABI local rather than adding
+        # a dependency solely for an optional storage optimisation.
+        ficlone = 0x40049409
+        try:
+            with source.open("rb") as input_file, destination.open("xb") as output_file:
+                try:
+                    fcntl.ioctl(output_file.fileno(), ficlone, input_file.fileno())
+                    shutil.copystat(source, destination, follow_symlinks=False)
+                    return True
+                except OSError:
+                    output_file.seek(0)
+                    input_file.seek(0)
+                    shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
+            shutil.copystat(source, destination, follow_symlinks=False)
+            return False
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _private_game_is_usable(root: Path) -> bool:
+        return (root / "manifest.json").is_file() and (root / "dofus1electron").is_file()
+
+    def materialize_retro(self, home: Path) -> Path:
+        """Create a writable, profile-private Retro view of the shared seed.
+
+        The immutable store is deliberately not mounted over a realm HOME:
+        Zaap needs to maintain a release marker and may update its own game
+        files.  Each realm instead receives a private CoW/copy materialization
+        containing only manifest-verified program bytes.  Account state and
+        launcher state are never imported from another realm.
+        """
+        snapshot = self.game_root()
+        if snapshot is None:
+            raise ProfileError("no verified shared Dofus payload is available")
+        current_data = self._current_data()
+        try:
+            home_root = home.resolve(strict=True)
+        except OSError as exc:
+            raise ProfileError("profile home is unavailable") from exc
+        if home_root.is_symlink() or home_root.stat().st_mode & 0o022:
+            raise ProfileError("profile home is unsafe")
+        destination = home_root / GAME_RELATIVE
+        parent = destination.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)
+        if destination.exists():
+            if destination.is_symlink() or not destination.is_dir():
+                raise ProfileError("profile game directory is unsafe")
+            if self._private_game_is_usable(destination):
+                self._seed_repository_release(home_root, current_data)
+                return destination
+            # Runtime setup can leave an empty Retro directory before a shared
+            # payload exists.  Remove only that empty shell; never overwrite
+            # unknown user data or an incomplete installation.
+            if any(destination.iterdir()):
+                raise ProfileError("profile game directory is incomplete; repair it before launching")
+            destination.rmdir()
+        try:
+            manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ProfileError("verified shared Dofus manifest is invalid") from exc
+        if not isinstance(manifest, dict):
+            raise ProfileError("verified shared Dofus manifest is invalid")
+        temporary = Path(tempfile.mkdtemp(prefix=".retro-view-", dir=parent))
+        reflinked = 0
+        copied = 0
+        try:
+            for raw, metadata in manifest.items():
+                relative = Path(raw)
+                if (not isinstance(raw, str) or relative.is_absolute() or ".." in relative.parts
+                        or not isinstance(metadata, dict) or not isinstance(metadata.get("size"), int)):
+                    raise ProfileError("verified shared Dofus manifest is unsafe")
+                source = (snapshot / relative).resolve(strict=True)
+                if not _inside(source, snapshot) or source.is_symlink() or not source.is_file():
+                    raise ProfileError("verified shared Dofus payload is invalid")
+                target = temporary / relative
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if self._copy_reflink_or_copy(source, target):
+                    reflinked += 1
+                else:
+                    copied += 1
+            shutil.copy2(snapshot / "manifest.json", temporary / "manifest.json")
+            descriptor = self._release_descriptor(snapshot)
+            if descriptor is not None:
+                (temporary / ".release.infos.json").write_text(
+                    json.dumps(descriptor, separators=(",", ":")) + "\n", encoding="utf-8"
+                )
+                os.chmod(temporary / ".release.infos.json", 0o600)
+            # Keep this marker beside the game view, not inside it: Zaap owns
+            # the directory contents and must be free to update them.
+            marker = parent / GAME_VIEW_MARKER
+            marker.write_text(json.dumps({
+                "snapshot": snapshot.name, "reflink_files": reflinked, "copied_files": copied,
+            }, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(marker, 0o600)
+            os.chmod(temporary, 0o700)
+            os.replace(temporary, destination)
+            self._seed_repository_release(home_root, current_data)
+            return destination
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
     def import_retro(self, home: Path) -> Path:
         """Promote a completed official Retro payload without importing state.
 
@@ -284,7 +510,10 @@ class ApplicationStore:
         os.chmod(self.games, 0o700)
         snapshot = "retro-" + _sha256(manifest)[:24]
         destination = self.games / snapshot
+        release = self._release_descriptor(source)
+        repository_release = self._repository_release(home_root, release["release"]) if release else None
         if destination.is_dir():
+            self._write_current(snapshot, manifest, repository_release)
             return destination
         temporary = Path(tempfile.mkdtemp(prefix=".retro-", dir=self.games))
         try:
@@ -297,8 +526,7 @@ class ApplicationStore:
                 if path.is_file(): os.chmod(path, 0o555 if os.access(path, os.X_OK) else 0o444)
                 elif path.is_dir(): os.chmod(path, 0o555)
             os.replace(temporary, destination)
-            self.current.write_text(json.dumps({"snapshot": snapshot, "manifest_sha256": _sha256(manifest)}, sort_keys=True) + "\n", encoding="utf-8")
-            os.chmod(self.current, 0o600)
+            self._write_current(snapshot, manifest, repository_release)
             return destination
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)

@@ -840,6 +840,17 @@ class RuntimeTests(unittest.TestCase):
             for library in ("libX11-xcb.so.1", "libEGL.so.1", "libGL.so.1"):
                 self.assertTrue(any(path.name == library for path in bundle.root.rglob(library)), library)
 
+    def test_host_runtime_bundle_contains_complete_gtk_icon_and_mime_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state, "host")
+            self.assertTrue((bundle.root / "usr/share/icons/Adwaita/index.theme").is_file())
+            self.assertTrue((bundle.root / "usr/share/icons/hicolor/index.theme").is_file())
+            self.assertTrue((bundle.root / "usr/share/mime/globs2").is_file())
+
     def test_runtime_bundle_contains_profile_controlled_synthetic_df(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -1007,6 +1018,24 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(("--uid", str(identity.runtime_uid)), zip(plan.argv, plan.argv[1:]))
             self.assertIn(("--gid", str(identity.runtime_gid)), zip(plan.argv, plan.argv[1:]))
             self.assertNotIn("--cap-add", plan.argv)
+
+    def test_plan_pins_a_staged_gdk_pixbuf_loader_cache(self):
+        profile = load_profile(EXAMPLE)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            identity = ensure_identity(profile, state)
+            app_root = Path(directory) / "app"
+            app_root.mkdir()
+            shutil.copy2("/bin/true", app_root / "zaap")
+            bundle = prepare_runtime_bundle(app_root, ["/opt/app/zaap"], state)
+            cache = bundle.root / "usr/lib/test-arch/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+            cache.parent.mkdir(parents=True)
+            cache.write_text("# private loader cache\n", encoding="ascii")
+            plan = prepare_plan(profile, identity, app_root, ["/opt/app/zaap"], "stub", bundle)
+            self.assertIn(
+                ("--setenv", "GDK_PIXBUF_MODULE_FILE", "/usr/lib/test-arch/gdk-pixbuf-2.0/2.10.0/loaders.cache"),
+                zip(plan.argv, plan.argv[1:], plan.argv[2:]),
+            )
 
     def test_vnc_plan_binds_only_private_x_socket_and_bridge_is_offline(self):
         profile = load_profile(EXAMPLE)

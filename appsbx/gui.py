@@ -912,7 +912,14 @@ if QT_AVAILABLE:
                     game = self.application_store.import_retro(self.store.identity_dir(record) / "home")
                 except ProfileError:
                     continue
-                QMessageBox.information(self, "Shared game ready", f"Verified Dofus files are now shared read-only:\n{game}")
+                QMessageBox.information(
+                    self,
+                    "Shared game ready",
+                    "Verified Dofus files are ready as a private game seed for new realms.\n\n"
+                    "Each realm receives its own writable game view, so Zaap can keep its release "
+                    "state and updates separate.\n\n"
+                    f"Managed seed: {game}",
+                )
                 self.show_section("settings")
                 return
             QMessageBox.warning(self, "No downloaded game found", "Download Dofus once through Zaap in a realm, close it, then choose Prepare shared game.")

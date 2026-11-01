@@ -44,14 +44,20 @@ real-network helper.
 
 After a clean launcher exit, Realms verifies the official game manifest and
 copies only its listed files to an immutable managed snapshot. Future realms
-mount that snapshot read-only at the expected game location. Realm logins,
-cookies, settings, key material, logs, locks, and caches remain private and
-are never shared.
+materialize that snapshot into their own writable game directory at the
+expected location. On filesystems supporting reflinks this is block-level
+copy-on-write; elsewhere it is a normal private copy. This is deliberate:
+Zaap must create a per-realm release marker before it recognizes an existing
+game as installed. No writable game files, logins, cookies, settings, key
+material, logs, locks, or caches are shared between realms.
 
 When an official update is required, stop all realms and choose **Update shared
 game…**. It opens one temporary private update session. Download the official
 update there and close Zaap; Realms then verifies and publishes a new snapshot.
-It never modifies the snapshot currently mounted by a running realm.
+It never modifies another realm's game directory. Existing realms retain their
+known-good private game view; newly created realms use the newly published
+snapshot. Refreshing an existing realm is intentionally a separate, explicit
+maintenance action rather than an automatic cross-realm update.
 
 ## Updating and removal
 
