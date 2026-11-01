@@ -862,7 +862,7 @@ class RuntimeTests(unittest.TestCase):
             helper = bundle.root / "usr" / "bin" / "df"
             self.assertTrue(helper.is_file())
             self.assertTrue(os.access(helper, os.X_OK))
-            self.assertIn("appsbxfs 52428800 0 52428800 0% /home/appsbx", helper.read_text())
+            self.assertIn("virtualfs 52428800 0 52428800 0% /home/appsbx", helper.read_text())
 
     def test_runtime_bundle_contains_fixed_zaap_first_install_launcher(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -15,7 +15,7 @@ class ApplicationStoreTests(unittest.TestCase):
         root = home / ".config/Ankama/Retro"
         root.mkdir(parents=True)
         executable = root / "dofus1electron"
-        executable.write_bytes(b"official game")
+        executable.write_bytes(b"\x7fELF" + b"official game")
         executable.chmod(0o755)
         data = root / "resources.pak"
         data.write_bytes(b"content")
@@ -43,6 +43,9 @@ class ApplicationStoreTests(unittest.TestCase):
             "version": "6.0_1.49.9.5673.465-64394b4",
             "accountToken": "must-not-cross-realms",
         }), encoding="utf-8")
+        (repository / "information.json").write_text('{"_schemaVersion":1,"version":"hash"}', encoding="utf-8")
+        (repository / "data").mkdir()
+        (repository / "data" / "release.json").write_text('{"displayName":"Dofus Retro","multiAccount":true}', encoding="utf-8")
         return root
 
     def test_import_is_immutable_and_excludes_unlisted_state(self):
@@ -100,6 +103,8 @@ class ApplicationStoreTests(unittest.TestCase):
             self.assertEqual(record["location"], "/home/appsbx/.config/Ankama/Retro")
             self.assertEqual(record["gameUid"], "retro")
             self.assertNotIn("accountToken", record)
+            self.assertTrue((second / ".config/zaap/repositories/production/retro/main/information.json").is_file())
+            self.assertTrue((second / ".config/zaap/repositories/production/retro/main/data/release.json").is_file())
             self.assertFalse((second / ".config/zaap/Settings").exists())
             # A launcher-owned record must not be overwritten at later runs.
             record_path.write_text('{"launcher":"owns-this"}', encoding="utf-8")
@@ -116,6 +121,19 @@ class ApplicationStoreTests(unittest.TestCase):
             }), encoding="utf-8")
             with self.assertRaisesRegex(ProfileError, "unsafe entry"):
                 ApplicationStore(Path(directory) / "state").import_retro(home)
+
+    def test_import_rejects_incomplete_non_elf_game_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "private-home"
+            game = self._game(home)
+            executable = game / "dofus1electron"
+            executable.write_bytes(b"\0" * 4096)
+            manifest = json.loads((game / "manifest.json").read_text(encoding="utf-8"))
+            manifest["dofus1electron"]["size"] = executable.stat().st_size
+            (game / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ProfileError, "not a Linux ELF"):
+                ApplicationStore(root / "state").import_retro(home)
 
     def test_missing_first_run_game_directory_is_a_recoverable_absence(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -26,6 +26,10 @@ LAUNCHER_MARKER = ".appsbx-launcher-store"
 GAME_RELATIVE = Path(".config/Ankama/Retro")
 GAME_VIEW_MARKER = ".appsbx-game-view.json"
 RETRO_REPOSITORY_RELATIVE = Path(".config/zaap/repositories/production/retro")
+RETRO_PUBLIC_ASSETS = (
+    "data/cover.jpg", "data/home_cover.jpg", "data/icon.png", "data/logo.png",
+    "data/shop-big.png", "data/shortcut.ico",
+)
 # The old support-page endpoint now redirects to an account-gated web page.
 # This is the current Ankama-owned production artifact endpoint.
 OFFICIAL_LAUNCHER_URL = (
@@ -295,22 +299,38 @@ class ApplicationStore:
         game_order = raw.get("gameOrder", 2)
         if not isinstance(game_id, int) or not isinstance(game_order, int):
             return None
+        fragments = raw.get("installedFragments", ["configuration", "main", "linux", "remastered"])
+        if not isinstance(fragments, list) or not all(isinstance(item, str) for item in fragments):
+            fragments = ["configuration", "main", "linux", "remastered"]
         record = {
+            "id": str(raw.get("id", "retromain")),
+            "name": release,
             "_schemaVersion": 1,
             "gameId": game_id,
             "gameName": "Retro",
             "gameOrder": game_order,
-            "gameUid": "retro",
+            "gameUid": "retro", "installedFragments": fragments, "isUpdating": False,
+            "isRepairing": False, "isDirty": False,
             # This is the sandbox-visible location, never a source realm path.
             "location": "/home/appsbx/.config/Ankama/Retro",
             "isInstalling": False,
             "repositoryVersion": repository_version,
             "version": version,
         }
-        return {"release": release, "record": record}
+        information = {"_schemaVersion": 1, "version": ""}
+        data_release = {"displayName": "Dofus Retro", "multiAccount": True}
+        try:
+            info = json.loads((path.parent / "information.json").read_text(encoding="utf-8"))
+            if isinstance(info, dict) and isinstance(info.get("version"), str):
+                information = info
+            details = json.loads((path.parent / "data/release.json").read_text(encoding="utf-8"))
+            if isinstance(details, dict):
+                data_release = details
+        except (OSError, ValueError, TypeError):
+            pass
+        return {"release": release, "record": record, "information": information, "data_release": data_release}
 
-    @staticmethod
-    def _seed_repository_release(home: Path, data: dict[str, object] | None) -> None:
+    def _seed_repository_release(self, home: Path, data: dict[str, object] | None) -> None:
         """Seed the safe per-realm installation record without overwriting it."""
         if data is None:
             return
@@ -323,7 +343,8 @@ class ApplicationStore:
                 or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for char in release)
                 or not isinstance(record, dict) or record.get("gameUid") != "retro"):
             return
-        target = home / RETRO_REPOSITORY_RELATIVE / release / "release.json"
+        target_root = home / RETRO_REPOSITORY_RELATIVE / release
+        target = target_root / "release.json"
         try:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             parent = target.parent.resolve(strict=True)
@@ -332,12 +353,42 @@ class ApplicationStore:
             raise ProfileError("profile launcher repository is unavailable") from exc
         if not _inside(parent, home_root) or target.is_symlink():
             raise ProfileError("profile launcher repository is unsafe")
-        if target.exists():
-            return
-        temporary = target.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, target)
+        # The release record may already exist from an earlier runtime.  Fill
+        # only missing public metadata files; never replace launcher-owned data.
+        files = {
+            target: record,
+            target_root / "information.json": envelope.get("information") or {"_schemaVersion": 1, "version": ""},
+            target_root / "data/release.json": envelope.get("data_release") or {"displayName": "Dofus Retro", "multiAccount": True},
+        }
+        for output, contents in files.items():
+            if output.exists() and output == target:
+                try:
+                    existing = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    existing = None
+                if (not isinstance(existing, dict) or existing.get("gameUid") != "retro" or existing.get("installedFragments")
+                        or existing.get("isUpdating") or existing.get("isRepairing") or existing.get("isDirty")):
+                    continue
+            elif output.exists():
+                continue
+            if not isinstance(contents, dict) or output.is_symlink():
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = output.with_suffix(output.suffix + ".tmp")
+            temporary.write_text(json.dumps(contents, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, output)
+        assets_root = envelope.get("assets")
+        if isinstance(assets_root, str):
+            source_root = self.games / assets_root
+            for relative in RETRO_PUBLIC_ASSETS:
+                source = source_root / relative
+                output = target_root / relative
+                if output.exists() or not source.is_file():
+                    continue
+                output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.copy2(source, output)
+                os.chmod(output, 0o600)
 
     @staticmethod
     def _release_descriptor(snapshot: Path) -> dict[str, str] | None:
@@ -505,6 +556,12 @@ class ApplicationStore:
         executable = source / "dofus1electron"
         if not os.access(executable, os.X_OK):
             raise ProfileError("official Dofus executable is not executable")
+        try:
+            with executable.open("rb") as handle:
+                if handle.read(4) != b"\x7fELF":
+                    raise ProfileError("official Dofus executable is not a Linux ELF file")
+        except OSError as exc:
+            raise ProfileError("official Dofus executable is unavailable") from exc
         self._ensure_root()
         self.games.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.games, 0o700)
@@ -512,6 +569,18 @@ class ApplicationStore:
         destination = self.games / snapshot
         release = self._release_descriptor(source)
         repository_release = self._repository_release(home_root, release["release"]) if release else None
+        assets_name = f"retro-assets-{snapshot.removeprefix('retro-')}"
+        assets_target = self.games / assets_name
+        assets_target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for relative in RETRO_PUBLIC_ASSETS:
+            source_asset = home_root / RETRO_REPOSITORY_RELATIVE / (release["release"] if release else "main") / relative
+            if source_asset.is_file() and not (assets_target / relative).exists():
+                target_asset = assets_target / relative
+                target_asset.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                shutil.copy2(source_asset, target_asset)
+                os.chmod(target_asset, 0o444)
+        if repository_release is not None:
+            repository_release["assets"] = assets_name
         if destination.is_dir():
             self._write_current(snapshot, manifest, repository_release)
             return destination

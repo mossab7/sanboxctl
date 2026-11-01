@@ -611,7 +611,7 @@ if QT_AVAILABLE:
     class MainWindow(QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("Realms  •  appsbx")
+            self.setWindowTitle("Realms  •  Zaap")
             self.resize(1180, 760)
             self.setMinimumSize(920, 620)
             profiles = load_profiles(PROFILES_DIR)
